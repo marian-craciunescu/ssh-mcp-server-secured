@@ -7,7 +7,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from 'ssh2';
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { resolve, basename, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -16,22 +16,292 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageJson = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf8'));
 
+// Default command filter configuration
+const DEFAULT_COMMAND_FILTER = {
+  // Mode: 'whitelist' (only allow listed) or 'blacklist' (block listed) or 'disabled'
+  mode: 'blacklist',
+
+  // Whitelist: only these commands/binaries are allowed when mode is 'whitelist'
+  whitelist: [
+    'ls', 'cat', 'head', 'tail', 'grep', 'awk', 'sed', 'find', 'wc', 'sort', 'uniq',
+    'df', 'du', 'free', 'uptime', 'whoami', 'pwd', 'date', 'hostname', 'uname',
+    'ps', 'top', 'htop', 'pgrep', 'pidof',
+    'systemctl', 'journalctl', 'service',
+    'docker', 'docker-compose', 'kubectl', 'helm',
+    'ping', 'curl', 'wget', 'dig', 'nslookup', 'host', 'traceroute', 'netstat', 'ss',
+    'git', 'npm', 'node', 'python', 'python3', 'pip', 'pip3',
+    'echo', 'printf', 'test', 'true', 'false', 'env', 'printenv',
+  ],
+
+  // Blacklist: these commands/patterns are blocked when mode is 'blacklist'
+  blacklist: [
+    'rm', 'rmdir', 'unlink',
+    'mkfs', 'fdisk', 'parted', 'dd',
+    'shutdown', 'reboot', 'halt', 'poweroff', 'init',
+    'useradd', 'userdel', 'usermod', 'passwd', 'chpasswd', 'groupadd', 'groupdel',
+    'visudo', 'sudoedit',
+    'iptables', 'ip6tables', 'nft', 'firewall-cmd', 'ufw',
+    'crontab',
+    'mount', 'umount',
+    'insmod', 'rmmod', 'modprobe',
+  ],
+
+  // Dangerous patterns (always blocked regardless of mode)
+  dangerousPatterns: [
+    ':\\(\\)\\s*\\{\\s*:|:&\\s*\\}\\s*;',  // Fork bomb
+    ';\\s*rm\\s+-rf',                       // ; rm -rf
+    '\\|\\s*rm',                            // | rm
+    '&&\\s*rm',                             // && rm
+    '\\|\\|\\s*rm',                         // || rm
+    '>\\s*/dev/',                           // redirect to /dev/
+    '>\\s*/etc/',                           // redirect to /etc/
+    '>\\s*/boot/',                          // redirect to /boot/
+    '>\\s*/sys/',                           // redirect to /sys/
+    '>\\s*/proc/',                          // redirect to /proc/
+    'mkfs',                                 // filesystem creation
+    'dd\\s+if=.*of=/dev',                   // dd to device
+    'chmod\\s+777\\s+/',                    // chmod 777 on root paths
+    'chmod\\s+-R\\s+777',                   // recursive chmod 777
+    'chown\\s+-R\\s+.*:\\s*/',              // recursive chown on root
+    '>\\.bashrc',                           // overwrite bashrc
+    '>\\.profile',                          // overwrite profile
+    'curl.*\\|\\s*bash',                    // curl | bash
+    'wget.*\\|\\s*bash',                    // wget | bash
+    'curl.*\\|\\s*sh',                      // curl | sh
+    'wget.*\\|\\s*sh',                      // wget | sh
+  ],
+
+  // Allow sudo prefix (if false, any sudo command is blocked)
+  allowSudo: true,
+
+  // Log blocked commands for audit
+  logBlocked: true,
+};
+
 class SSHMCPServer {
   constructor() {
     this.server = new Server(
-      {
-        name: 'ssh-mcp-server',
-        version: packageJson.version,
-      },
-      {
-        capabilities: {
-          tools: {},
+        {
+          name: 'ssh-mcp-server-secured',
+          version: packageJson.version,
         },
-      }
+        {
+          capabilities: {
+            tools: {},
+          },
+        }
     );
 
     this.connections = new Map();
+    this.commandFilter = this.loadCommandFilter();
     this.setupToolHandlers();
+  }
+
+  /**
+   * Load command filter configuration from file or environment
+   */
+  loadCommandFilter() {
+    const config = { ...DEFAULT_COMMAND_FILTER };
+
+    // Check for config file
+    const configPaths = [
+      process.env.SSH_MCP_CONFIG,
+      resolve(__dirname, 'config.json'),
+      resolve(process.cwd(), 'ssh-mcp-config.json'),
+    ].filter(Boolean);
+
+    for (const configPath of configPaths) {
+      if (configPath && existsSync(configPath)) {
+        try {
+          const fileConfig = JSON.parse(readFileSync(configPath, 'utf8'));
+          if (fileConfig.commandFilter) {
+            Object.assign(config, fileConfig.commandFilter);
+            console.log(`Loaded command filter config from: ${configPath}`);
+          }
+        } catch (error) {
+          console.error(`Failed to load config from ${configPath}: ${error.message}`);
+        }
+        break;
+      }
+    }
+
+    // Override with environment variables
+    if (process.env.SSH_FILTER_MODE) {
+      config.mode = process.env.SSH_FILTER_MODE;
+    }
+    if (process.env.SSH_ALLOW_SUDO !== undefined) {
+      config.allowSudo = process.env.SSH_ALLOW_SUDO === 'true';
+    }
+    if (process.env.SSH_LOG_BLOCKED !== undefined) {
+      config.logBlocked = process.env.SSH_LOG_BLOCKED === 'true';
+    }
+
+    // Parse whitelist from env (comma-separated or JSON array)
+    if (process.env.SSH_WHITELIST) {
+      try {
+        // Try JSON array first
+        if (process.env.SSH_WHITELIST.startsWith('[')) {
+          config.whitelist = JSON.parse(process.env.SSH_WHITELIST);
+        } else {
+          // Comma-separated list
+          config.whitelist = process.env.SSH_WHITELIST.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        console.error(`Loaded whitelist from env: ${config.whitelist.length} commands`);
+      } catch (error) {
+        console.error(`Failed to parse SSH_WHITELIST: ${error.message}`);
+      }
+    }
+
+    // Parse blacklist from env (comma-separated or JSON array)
+    if (process.env.SSH_BLACKLIST) {
+      try {
+        if (process.env.SSH_BLACKLIST.startsWith('[')) {
+          config.blacklist = JSON.parse(process.env.SSH_BLACKLIST);
+        } else {
+          config.blacklist = process.env.SSH_BLACKLIST.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        console.error(`Loaded blacklist from env: ${config.blacklist.length} commands`);
+      } catch (error) {
+        console.error(`Failed to parse SSH_BLACKLIST: ${error.message}`);
+      }
+    }
+
+    // Parse dangerous patterns from env (JSON array of regex strings)
+    if (process.env.SSH_DANGEROUS_PATTERNS) {
+      try {
+        config.dangerousPatterns = JSON.parse(process.env.SSH_DANGEROUS_PATTERNS);
+        console.error(`Loaded dangerous patterns from env: ${config.dangerousPatterns.length} patterns`);
+      } catch (error) {
+        console.error(`Failed to parse SSH_DANGEROUS_PATTERNS: ${error.message}`);
+      }
+    }
+
+    // Convert arrays to Sets for faster lookup
+    return {
+      mode: config.mode,
+      whitelist: new Set(config.whitelist),
+      blacklist: new Set(config.blacklist),
+      dangerousPatterns: config.dangerousPatterns.map(p => new RegExp(p, 'i')),
+      allowSudo: config.allowSudo,
+      logBlocked: config.logBlocked,
+    };
+  }
+
+  /**
+   * Extract the base command/binary from a command string
+   */
+  extractBaseCommand(command) {
+    let cmd = command.trim();
+
+    // Handle sudo prefix
+    if (cmd.startsWith('sudo ')) {
+      cmd = cmd.slice(5).trim();
+      // Handle sudo flags like -S, -u, etc.
+      while (cmd.startsWith('-')) {
+        cmd = cmd.replace(/^-\S*\s*/, '').trim();
+        // Handle -u username pattern
+        if (cmd.match(/^\S+\s+/)) {
+          const parts = cmd.split(/\s+/);
+          if (parts[0] && !parts[0].startsWith('-') && parts[0].match(/^[a-z_][a-z0-9_-]*$/i)) {
+            cmd = parts.slice(1).join(' ');
+          }
+        }
+      }
+    }
+
+    // Handle environment variables prefix (VAR=value cmd)
+    while (/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/.test(cmd)) {
+      cmd = cmd.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/, '');
+    }
+
+    // Handle path prefix (/usr/bin/ls -> ls)
+    const firstPart = cmd.split(/\s+/)[0];
+    if (!firstPart) return '';
+
+    const baseName = firstPart.split('/').pop();
+    return baseName || '';
+  }
+
+  /**
+   * Extract ALL commands from a complex command string
+   */
+  extractAllCommands(command) {
+    const commands = [];
+
+    // Split by command separators: |, &&, ||, ;, &
+    // But be careful with quoted strings
+    const parts = command.split(/\s*(?:\|{1,2}|&&?|;)\s*/);
+
+    for (const part of parts) {
+      const baseCmd = this.extractBaseCommand(part.trim());
+      if (baseCmd) {
+        commands.push(baseCmd);
+      }
+    }
+
+    return commands;
+  }
+
+  /**
+   * Validate a command against whitelist/blacklist rules
+   */
+  validateCommand(command) {
+    if (this.commandFilter.mode === 'disabled') {
+      return { allowed: true, reason: 'Command filtering disabled' };
+    }
+
+    const trimmedCmd = command.trim();
+
+    // Check for sudo if not allowed
+    if (!this.commandFilter.allowSudo && /^\s*sudo\s+/.test(trimmedCmd)) {
+      this.logBlockedCommand(command, 'sudo commands are not permitted');
+      return { allowed: false, reason: 'sudo commands are not permitted' };
+    }
+
+    // Always check dangerous patterns first (regardless of mode)
+    for (const pattern of this.commandFilter.dangerousPatterns) {
+      if (pattern.test(trimmedCmd)) {
+        const reason = `Command matches dangerous pattern: ${pattern.toString()}`;
+        this.logBlockedCommand(command, reason);
+        return { allowed: false, reason };
+      }
+    }
+
+    // Extract all commands from the string
+    const allCommands = this.extractAllCommands(trimmedCmd);
+
+    if (this.commandFilter.mode === 'whitelist') {
+      for (const cmd of allCommands) {
+        if (!this.commandFilter.whitelist.has(cmd)) {
+          const reason = `Command '${cmd}' is not in the allowed whitelist`;
+          this.logBlockedCommand(command, reason);
+          return { allowed: false, reason };
+        }
+      }
+      return { allowed: true, reason: 'All commands are whitelisted' };
+
+    } else if (this.commandFilter.mode === 'blacklist') {
+      for (const cmd of allCommands) {
+        if (this.commandFilter.blacklist.has(cmd)) {
+          const reason = `Command '${cmd}' is blocked by blacklist`;
+          this.logBlockedCommand(command, reason);
+          return { allowed: false, reason };
+        }
+      }
+      return { allowed: true, reason: 'No commands are blacklisted' };
+    }
+
+    return { allowed: true, reason: 'Unknown mode, allowing' };
+  }
+
+  /**
+   * Log blocked commands for audit purposes
+   */
+  logBlockedCommand(command, reason) {
+    if (this.commandFilter.logBlocked) {
+      const timestamp = new Date().toISOString();
+      console.error(`[${timestamp}] BLOCKED: "${command}" - ${reason}`);
+    }
   }
 
   setupToolHandlers() {
@@ -46,6 +316,10 @@ class SSHMCPServer {
               host: {
                 type: 'string',
                 description: 'SSH server hostname or IP address (IPv4 or IPv6)',
+              },
+              hostname: {
+                type: 'string',
+                description: 'Alias for host (for compatibility)',
               },
               port: {
                 type: 'number',
@@ -74,12 +348,12 @@ class SSHMCPServer {
                 default: 'default',
               },
             },
-            required: ['host', 'username'],
+            required: ['username'],
           },
         },
         {
           name: 'ssh_execute',
-          description: 'Execute a command on an established SSH connection',
+          description: 'Execute a command on an established SSH connection. Commands are validated against security filters.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -96,6 +370,11 @@ class SSHMCPServer {
                 type: 'number',
                 description: 'Command timeout in milliseconds',
                 default: 30000,
+              },
+              pty: {
+                type: 'boolean',
+                description: 'Allocate a pseudo-terminal (needed for some interactive commands)',
+                default: false,
               },
             },
             required: ['command'],
@@ -124,8 +403,30 @@ class SSHMCPServer {
           },
         },
         {
+          name: 'ssh_get_filter_config',
+          description: 'Get the current command filter configuration',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'ssh_validate_command',
+          description: 'Check if a command would be allowed by the security filter without executing it',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              command: {
+                type: 'string',
+                description: 'Command to validate',
+              },
+            },
+            required: ['command'],
+          },
+        },
+        {
           name: 'ssh_execute_script',
-          description: 'Execute a multi-line script or code block on an SSH connection. Automatically handles code blocks with triple backticks.',
+          description: 'Execute a multi-line script or code block on an SSH connection. Scripts are validated against security filters.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -151,45 +452,6 @@ class SSHMCPServer {
               workingDir: {
                 type: 'string',
                 description: 'Working directory to execute script in (optional)',
-              },
-            },
-            required: ['script'],
-          },
-        },
-        {
-          name: 'ssh_upload_and_execute',
-          description: 'Upload a script file and execute it on the remote server',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              script: {
-                type: 'string',
-                description: 'Script content to upload and execute',
-              },
-              filename: {
-                type: 'string',
-                description: 'Filename for the script on remote server',
-                default: 'mcp_script.sh',
-              },
-              interpreter: {
-                type: 'string',
-                description: 'Script interpreter (bash, python, etc.)',
-                default: 'bash',
-              },
-              connectionId: {
-                type: 'string',
-                description: 'Connection ID to use',
-                default: 'default',
-              },
-              cleanup: {
-                type: 'boolean',
-                description: 'Remove script file after execution',
-                default: true,
-              },
-              timeout: {
-                type: 'number',
-                description: 'Execution timeout in milliseconds',
-                default: 60000,
               },
             },
             required: ['script'],
@@ -291,10 +553,12 @@ class SSHMCPServer {
             return await this.handleSSHDisconnect(args);
           case 'ssh_list_connections':
             return await this.handleListConnections(args);
+          case 'ssh_get_filter_config':
+            return await this.handleGetFilterConfig();
+          case 'ssh_validate_command':
+            return await this.handleValidateCommand(args);
           case 'ssh_execute_script':
             return await this.handleSSHExecuteScript(args);
-          case 'ssh_upload_and_execute':
-            return await this.handleSSHUploadAndExecute(args);
           case 'ssh_upload_file':
             return await this.handleSSHUploadFile(args);
           case 'ssh_download_file':
@@ -320,7 +584,8 @@ class SSHMCPServer {
 
   async handleSSHConnect(args) {
     const {
-      host,
+      host: hostParam,
+      hostname,  // Accept both for compatibility
       port = 22,
       username,
       password,
@@ -329,13 +594,20 @@ class SSHMCPServer {
       connectionId = 'default',
     } = args;
 
+    // Use host or hostname (host takes precedence)
+    const host = hostParam || hostname;
+
+    if (!host) {
+      throw new Error('host (or hostname) is required');
+    }
+
     if (this.connections.has(connectionId)) {
       throw new Error(`Connection '${connectionId}' already exists. Disconnect first or use a different ID.`);
     }
 
     return new Promise((resolve, reject) => {
       const conn = new Client();
-      
+
       const config = {
         host,
         port,
@@ -366,7 +638,7 @@ class SSHMCPServer {
       }
 
       conn.on('ready', () => {
-        this.connections.set(connectionId, conn);
+        this.connections.set(connectionId, { conn, host, port, username });
         resolve({
           content: [
             {
@@ -390,12 +662,20 @@ class SSHMCPServer {
   }
 
   async handleSSHExecute(args) {
-    const { command, connectionId = 'default', timeout = 30000 } = args;
+    const { command, connectionId = 'default', timeout = 30000, pty = false } = args;
 
-    const conn = this.connections.get(connectionId);
-    if (!conn) {
+    // Validate command before execution
+    const validation = this.validateCommand(command);
+    if (!validation.allowed) {
+      throw new Error(`Command blocked: ${validation.reason}`);
+    }
+
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
+
+    const { conn } = connection;
 
     return new Promise((resolve, reject) => {
       let output = '';
@@ -405,30 +685,43 @@ class SSHMCPServer {
         reject(new Error(`Command timeout after ${timeout}ms`));
       }, timeout);
 
-      conn.exec(command, (err, stream) => {
+      const execOptions = {};
+
+      // Request PTY if needed (for sudo -S or interactive commands)
+      if (pty || (command.includes('sudo') && command.includes('-S'))) {
+        execOptions.pty = {
+          rows: 24,
+          cols: 80,
+          height: 480,
+          width: 640,
+          term: 'xterm'
+        };
+      }
+
+      conn.exec(command, execOptions, (err, stream) => {
         if (err) {
           clearTimeout(timeoutId);
           return reject(new Error(`Failed to execute command: ${err.message}`));
         }
 
         stream
-          .on('close', (code, signal) => {
-            clearTimeout(timeoutId);
-            resolve({
-              content: [
-                {
-                  type: 'text',
-                  text: `Command: ${command}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n${output}${errorOutput ? `\nError Output:\n${errorOutput}` : ''}`,
-                },
-              ],
-            });
-          })
-          .on('data', (data) => {
-            output += data.toString();
-          })
-          .stderr.on('data', (data) => {
-            errorOutput += data.toString();
-          });
+            .on('close', (code, signal) => {
+              clearTimeout(timeoutId);
+              resolve({
+                content: [
+                  {
+                    type: 'text',
+                    text: `Command: ${command}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n${output}${errorOutput ? `\nError Output:\n${errorOutput}` : ''}`,
+                  },
+                ],
+              });
+            })
+            .on('data', (data) => {
+              output += data.toString();
+            })
+            .stderr.on('data', (data) => {
+          errorOutput += data.toString();
+        });
       });
     });
   }
@@ -436,12 +729,12 @@ class SSHMCPServer {
   async handleSSHDisconnect(args) {
     const { connectionId = 'default' } = args;
 
-    const conn = this.connections.get(connectionId);
-    if (!conn) {
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
-    conn.end();
+    connection.conn.end();
     this.connections.delete(connectionId);
 
     return {
@@ -455,42 +748,98 @@ class SSHMCPServer {
   }
 
   async handleListConnections() {
-    const connectionList = Array.from(this.connections.keys());
-    
+    const connectionList = Array.from(this.connections.entries()).map(([id, info]) => ({
+      id,
+      host: info.host,
+      port: info.port,
+      username: info.username,
+    }));
+
     return {
       content: [
         {
           type: 'text',
-          text: connectionList.length > 0 
-            ? `Active connections: ${connectionList.join(', ')}`
-            : 'No active connections',
+          text: connectionList.length > 0
+              ? `Active connections:\n${connectionList.map(c => `  - ${c.id}: ${c.username}@${c.host}:${c.port}`).join('\n')}`
+              : 'No active connections',
+        },
+      ],
+    };
+  }
+
+  async handleGetFilterConfig() {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            mode: this.commandFilter.mode,
+            allowSudo: this.commandFilter.allowSudo,
+            logBlocked: this.commandFilter.logBlocked,
+            whitelistCount: this.commandFilter.whitelist.size,
+            blacklistCount: this.commandFilter.blacklist.size,
+            dangerousPatternsCount: this.commandFilter.dangerousPatterns.length,
+            whitelist: Array.from(this.commandFilter.whitelist),
+            blacklist: Array.from(this.commandFilter.blacklist),
+          }, null, 2),
+        },
+      ],
+    };
+  }
+
+  async handleValidateCommand(args) {
+    const { command } = args;
+    const validation = this.validateCommand(command);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            command,
+            allowed: validation.allowed,
+            reason: validation.reason,
+            extractedCommands: this.extractAllCommands(command),
+          }, null, 2),
         },
       ],
     };
   }
 
   extractCodeFromBlock(script) {
-    // Remove triple backticks and language specifiers
     const codeBlockRegex = /^```[\w]*\n?([\s\S]*?)\n?```$/;
     const match = script.trim().match(codeBlockRegex);
     return match ? match[1].trim() : script.trim();
   }
 
   async handleSSHExecuteScript(args) {
-    const { 
-      script, 
-      interpreter = 'bash', 
-      connectionId = 'default', 
+    const {
+      script,
+      interpreter = 'bash',
+      connectionId = 'default',
       timeout = 60000,
-      workingDir 
+      workingDir
     } = args;
 
-    const conn = this.connections.get(connectionId);
-    if (!conn) {
+    // Validate interpreter
+    const interpreterValidation = this.validateCommand(interpreter);
+    if (!interpreterValidation.allowed) {
+      throw new Error(`Interpreter blocked: ${interpreterValidation.reason}`);
+    }
+
+    // Validate script content for dangerous patterns
+    for (const pattern of this.commandFilter.dangerousPatterns) {
+      if (pattern.test(script)) {
+        throw new Error(`Script contains dangerous pattern: ${pattern.toString()}`);
+      }
+    }
+
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
-    // Extract code from blocks if present
+    const { conn } = connection;
     const cleanScript = this.extractCodeFromBlock(script);
 
     return new Promise((resolve, reject) => {
@@ -501,20 +850,17 @@ class SSHMCPServer {
         reject(new Error(`Script timeout after ${timeout}ms`));
       }, timeout);
 
-      // Create a temporary script file and execute it
       const scriptName = `mcp_temp_${Date.now()}.${interpreter === 'python' || interpreter === 'python3' ? 'py' : 'sh'}`;
       const remotePath = `/tmp/${scriptName}`;
-      
-      // Prepare the script content with proper shebang
+
       let scriptContent = cleanScript;
       if (!scriptContent.startsWith('#!')) {
-        const shebang = interpreter === 'python' || interpreter === 'python3' 
-          ? '#!/usr/bin/env python3' 
-          : '#!/bin/bash';
+        const shebang = interpreter === 'python' || interpreter === 'python3'
+            ? '#!/usr/bin/env python3'
+            : '#!/bin/bash';
         scriptContent = `${shebang}\n${scriptContent}`;
       }
 
-      // Upload script file
       conn.sftp((err, sftp) => {
         if (err) {
           clearTimeout(timeoutId);
@@ -526,7 +872,6 @@ class SSHMCPServer {
         writeStream.end();
 
         writeStream.on('close', () => {
-          // Make script executable and run it
           const cdCommand = workingDir ? `cd "${workingDir}" && ` : '';
           const command = `${cdCommand}chmod +x ${remotePath} && ${remotePath} && rm -f ${remotePath}`;
 
@@ -537,111 +882,23 @@ class SSHMCPServer {
             }
 
             stream
-              .on('close', (code, signal) => {
-                clearTimeout(timeoutId);
-                resolve({
-                  content: [
-                    {
-                      type: 'text',
-                      text: `Script executed with ${interpreter}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n${output}${errorOutput ? `\nError Output:\n${errorOutput}` : ''}`,
-                    },
-                  ],
-                });
-              })
-              .on('data', (data) => {
-                output += data.toString();
-              })
-              .stderr.on('data', (data) => {
-                errorOutput += data.toString();
-              });
-          });
-        });
-
-        writeStream.on('error', (err) => {
-          clearTimeout(timeoutId);
-          reject(new Error(`Failed to upload script: ${err.message}`));
-        });
-      });
-    });
-  }
-
-  async handleSSHUploadAndExecute(args) {
-    const { 
-      script, 
-      filename = 'mcp_script.sh',
-      interpreter = 'bash',
-      connectionId = 'default',
-      cleanup = true,
-      timeout = 60000
-    } = args;
-
-    const conn = this.connections.get(connectionId);
-    if (!conn) {
-      throw new Error(`No active connection found for ID: ${connectionId}`);
-    }
-
-    // Extract code from blocks if present
-    const cleanScript = this.extractCodeFromBlock(script);
-
-    return new Promise((resolve, reject) => {
-      let output = '';
-      let errorOutput = '';
-
-      const timeoutId = setTimeout(() => {
-        reject(new Error(`Upload and execute timeout after ${timeout}ms`));
-      }, timeout);
-
-      const remotePath = `/tmp/${basename(filename)}`;
-      
-      // Prepare the script content
-      let scriptContent = cleanScript;
-      if (!scriptContent.startsWith('#!')) {
-        const shebang = interpreter === 'python' || interpreter === 'python3' 
-          ? '#!/usr/bin/env python3' 
-          : '#!/bin/bash';
-        scriptContent = `${shebang}\n${scriptContent}`;
-      }
-
-      // Upload script file
-      conn.sftp((err, sftp) => {
-        if (err) {
-          clearTimeout(timeoutId);
-          return reject(new Error(`SFTP error: ${err.message}`));
-        }
-
-        const writeStream = sftp.createWriteStream(remotePath);
-        writeStream.write(scriptContent);
-        writeStream.end();
-
-        writeStream.on('close', () => {
-          // Make script executable and run it
-          const cleanupCmd = cleanup ? ` && rm -f ${remotePath}` : '';
-          const command = `chmod +x ${remotePath} && ${remotePath}${cleanupCmd}`;
-
-          conn.exec(command, (err, stream) => {
-            if (err) {
-              clearTimeout(timeoutId);
-              return reject(new Error(`Failed to execute uploaded script: ${err.message}`));
-            }
-
-            stream
-              .on('close', (code, signal) => {
-                clearTimeout(timeoutId);
-                resolve({
-                  content: [
-                    {
-                      type: 'text',
-                      text: `Uploaded and executed: ${filename}\nInterpreter: ${interpreter}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n${output}${errorOutput ? `\nError Output:\n${errorOutput}` : ''}${cleanup ? '\nScript file removed after execution.' : `\nScript file preserved at: ${remotePath}`}`,
-                    },
-                  ],
-                });
-              })
-              .on('data', (data) => {
-                output += data.toString();
-              })
-              .stderr.on('data', (data) => {
-                errorOutput += data.toString();
-              });
+                .on('close', (code, signal) => {
+                  clearTimeout(timeoutId);
+                  resolve({
+                    content: [
+                      {
+                        type: 'text',
+                        text: `Script executed with ${interpreter}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n${output}${errorOutput ? `\nError Output:\n${errorOutput}` : ''}`,
+                      },
+                    ],
+                  });
+                })
+                .on('data', (data) => {
+                  output += data.toString();
+                })
+                .stderr.on('data', (data) => {
+              errorOutput += data.toString();
+            });
           });
         });
 
@@ -656,18 +913,18 @@ class SSHMCPServer {
   async handleSSHUploadFile(args) {
     const { localPath, remotePath, connectionId = 'default', createDirs = true } = args;
 
-    const conn = this.connections.get(connectionId);
-    if (!conn) {
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
+    const { conn } = connection;
     const absoluteLocalPath = resolve(localPath);
 
     return new Promise((resolve, reject) => {
-      // Check if local file exists
       try {
         const fileContent = readFileSync(absoluteLocalPath);
-        
+
         conn.sftp((err, sftp) => {
           if (err) {
             return reject(new Error(`SFTP error: ${err.message}`));
@@ -697,8 +954,7 @@ class SSHMCPServer {
           if (createDirs) {
             const remoteDir = dirname(remotePath);
             if (remoteDir !== '.' && remoteDir !== '/') {
-              sftp.mkdir(remoteDir, { recursive: true }, (err) => {
-                // Ignore mkdir errors (directory might already exist)
+              sftp.mkdir(remoteDir, { recursive: true }, () => {
                 uploadFile();
               });
             } else {
@@ -717,11 +973,12 @@ class SSHMCPServer {
   async handleSSHDownloadFile(args) {
     const { remotePath, localPath, connectionId = 'default', createDirs = true } = args;
 
-    const conn = this.connections.get(connectionId);
-    if (!conn) {
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
 
+    const { conn } = connection;
     const absoluteLocalPath = resolve(localPath);
 
     return new Promise((resolve, reject) => {
@@ -776,10 +1033,12 @@ class SSHMCPServer {
   async handleSSHListFiles(args) {
     const { remotePath = '.', connectionId = 'default', detailed = false } = args;
 
-    const conn = this.connections.get(connectionId);
-    if (!conn) {
+    const connection = this.connections.get(connectionId);
+    if (!connection) {
       throw new Error(`No active connection found for ID: ${connectionId}`);
     }
+
+    const { conn } = connection;
 
     try {
       const sftp = await new Promise((resolve, reject) => {
@@ -805,30 +1064,30 @@ class SSHMCPServer {
       if (detailed) {
         output += 'Permissions  Size     Modified                Name\n';
         output += '-'.repeat(60) + '\n';
-        
+
         list.forEach(item => {
           const isDir = item.attrs.isDirectory() ? 'd' : '-';
           const perms = item.attrs.mode ? (item.attrs.mode & parseInt('777', 8)).toString(8).padStart(3, '0') : '???';
           const size = item.attrs.size ? item.attrs.size.toString().padStart(8) : '???';
           const mtime = item.attrs.mtime ? new Date(item.attrs.mtime * 1000).toISOString() : 'Unknown';
-          
+
           output += `${isDir}${perms}      ${size}   ${mtime}  ${item.filename}\n`;
         });
       } else {
         const dirs = list.filter(item => item.attrs.isDirectory()).map(item => item.filename + '/');
         const files = list.filter(item => !item.attrs.isDirectory()).map(item => item.filename);
-        
+
         if (dirs.length > 0) {
           output += 'Directories:\n';
           dirs.forEach(dir => output += `  ${dir}\n`);
           output += '\n';
         }
-        
+
         if (files.length > 0) {
           output += 'Files:\n';
           files.forEach(file => output += `  ${file}\n`);
         }
-        
+
         if (dirs.length === 0 && files.length === 0) {
           output += 'Directory is empty';
         }
@@ -850,7 +1109,8 @@ class SSHMCPServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('SSH MCP Server running on stdio');
+    console.error(`SSH MCP Server (Secured) v${packageJson.version} running on stdio`);
+    console.error(`Command filter mode: ${this.commandFilter.mode}`);
   }
 }
 
