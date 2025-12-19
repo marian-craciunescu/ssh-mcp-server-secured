@@ -116,7 +116,7 @@ class SSHMCPServer {
           const fileConfig = JSON.parse(readFileSync(configPath, 'utf8'));
           if (fileConfig.commandFilter) {
             Object.assign(config, fileConfig.commandFilter);
-            console.log(`Loaded command filter config from: ${configPath}`);
+            console.error(`Loaded command filter config from: ${configPath}`);
           }
         } catch (error) {
           console.error(`Failed to load config from ${configPath}: ${error.message}`);
@@ -196,15 +196,19 @@ class SSHMCPServer {
     // Handle sudo prefix
     if (cmd.startsWith('sudo ')) {
       cmd = cmd.slice(5).trim();
-      // Handle sudo flags like -S, -u, etc.
+      // Handle sudo flags like -S, -u, -p, etc.
       while (cmd.startsWith('-')) {
-        cmd = cmd.replace(/^-\S*\s*/, '').trim();
-        // Handle -u username pattern
-        if (cmd.match(/^\S+\s+/)) {
-          const parts = cmd.split(/\s+/);
-          if (parts[0] && !parts[0].startsWith('-') && parts[0].match(/^[a-z_][a-z0-9_-]*$/i)) {
-            cmd = parts.slice(1).join(' ');
+        const flagMatch = cmd.match(/^-(\S+)\s*/);
+        if (flagMatch) {
+          const flag = flagMatch[1];
+          cmd = cmd.slice(flagMatch[0].length);
+          // Flags that take an argument: -u, -g, -p, -r, -t, -C, -h
+          if (/^[ugprtCh]/.test(flag) && cmd && !cmd.startsWith('-')) {
+            // Skip the argument
+            cmd = cmd.replace(/^\S+\s*/, '');
           }
+        } else {
+          break;
         }
       }
     }
@@ -552,7 +556,7 @@ class SSHMCPServer {
           case 'ssh_disconnect':
             return await this.handleSSHDisconnect(args);
           case 'ssh_list_connections':
-            return await this.handleListConnections(args);
+            return await this.handleListConnections();
           case 'ssh_get_filter_config':
             return await this.handleGetFilterConfig();
           case 'ssh_validate_command':
