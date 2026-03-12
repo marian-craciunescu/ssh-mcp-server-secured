@@ -356,10 +356,19 @@ Log format:
 | `SSH_DANGEROUS_PATTERNS` | JSON array | - | Override dangerous regex patterns |
 | `SSH_LOG_LEVEL` | `DEBUG`, `INFO`, `WARN`, `ERROR` | `INFO` | Log verbosity |
 | `SSH_LOG_FILE` | path | - | Log to file |
+| `SSH_HOST_FILTER_MODE`| whitelist, blacklist, disabled | disabled | Host filtering mode |
+| `SSH_HOST_WHITELIST` | comma-separated IPs | - | Whitelist of allowed host IPs |
+| `SSH_HOST_BLACKLIST` | comma-separated IPs | - | Blacklist of allowed host IPs |
+| `SSH_IDLE_TIMEOUT` | seconds | 120 | Idle connection timeout |
+
 
 Any additional environment variables following the `<CONNECTIONID>_PASSWORD` convention are automatically used for credential resolution (see [Credential Resolution Convention](#credential-resolution-convention)).
 
 ### MCP Configuration Examples
+
+
+### Host whitelist/blacklist:
+
 
 **Blacklist mode with custom blocked commands:**
 

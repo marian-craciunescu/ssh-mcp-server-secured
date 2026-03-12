@@ -106,18 +106,6 @@ const DEFAULT_COMMAND_FILTER = {
 };
 
 // =============================================================================
-// DEFAULT HOST FILTER CONFIGURATION
-// =============================================================================
-// Controls which hosts/IPs are allowed for SSH connections.
-// Env vars: SSH_HOST_FILTER_MODE (disabled|whitelist|blacklist),
-//           SSH_HOST_WHITELIST, SSH_HOST_BLACKLIST (comma-separated or JSON array)
-const DEFAULT_HOST_FILTER = {
-    mode: 'disabled',  // 'disabled', 'whitelist', 'blacklist'
-    whitelist: [],
-    blacklist: [],
-};
-
-// =============================================================================
 // JUMP SHELL PRESETS
 // =============================================================================
 // Built-in configurations for "SSH → enter nested CLI" scenarios.
@@ -156,15 +144,7 @@ class SSHMCPServer {
 
         this.connections = new Map(); // connectionId -> { conn, host, port, username, deviceType, shell, shellBuffer }
         this.commandFilter = this.loadCommandFilter();
-        this.hostFilter = this.loadHostFilter();
         this.setupToolHandlers();
-
-        // Idle timeout: disconnect after N seconds of no commands (0 = disabled)
-        this.idleTimeoutSeconds = parseInt(process.env.SSH_IDLE_TIMEOUT || '120', 10);
-        if (this.idleTimeoutSeconds > 0) {
-            this._idleCheckInterval = setInterval(() => this._checkIdleConnections(), 30000);
-            logger.info(`Idle timeout enabled: ${this.idleTimeoutSeconds}s`);
-        }
 
         logger.info('SSH MCP Server initialized', { version: packageJson.version });
     }
@@ -248,90 +228,6 @@ class SSHMCPServer {
         return result;
     }
 
-    loadHostFilter() {
-        const config = { ...DEFAULT_HOST_FILTER };
-
-        // Load from config file (same ssh-mcp-config.json)
-        const configPaths = [
-            resolve(__dirname, 'ssh-mcp-config.json'),
-            resolve(process.env.HOME || '/root', '.ssh-mcp-config.json'),
-        ];
-        for (const cfgPath of configPaths) {
-            if (existsSync(cfgPath)) {
-                try {
-                    const fileConfig = JSON.parse(readFileSync(cfgPath, 'utf8'));
-                    if (fileConfig.hostFilter) {
-                        Object.assign(config, fileConfig.hostFilter);
-                        logger.info(`Host filter loaded from ${cfgPath}`);
-                    }
-                } catch (e) {
-                    logger.debug(`Could not parse host filter from ${cfgPath}`, { error: e.message });
-                }
-                break;
-            }
-        }
-
-        // Env var overrides
-        if (process.env.SSH_HOST_FILTER_MODE) config.mode = process.env.SSH_HOST_FILTER_MODE;
-
-        if (process.env.SSH_HOST_WHITELIST) {
-            config.whitelist = process.env.SSH_HOST_WHITELIST.startsWith('[')
-                ? JSON.parse(process.env.SSH_HOST_WHITELIST)
-                : process.env.SSH_HOST_WHITELIST.split(',').map(s => s.trim()).filter(Boolean);
-            logger.info(`Loaded host whitelist from env: ${config.whitelist.length} entries`);
-        }
-
-        if (process.env.SSH_HOST_BLACKLIST) {
-            config.blacklist = process.env.SSH_HOST_BLACKLIST.startsWith('[')
-                ? JSON.parse(process.env.SSH_HOST_BLACKLIST)
-                : process.env.SSH_HOST_BLACKLIST.split(',').map(s => s.trim()).filter(Boolean);
-            logger.info(`Loaded host blacklist from env: ${config.blacklist.length} entries`);
-        }
-
-        const normalizedWhitelist = config.whitelist.map(s => s.toLowerCase().trim());
-        const normalizedBlacklist = config.blacklist.map(s => s.toLowerCase().trim());
-
-        const result = {
-            mode: config.mode,
-            whitelist: new Set(normalizedWhitelist),
-            blacklist: new Set(normalizedBlacklist),
-        };
-
-        logger.info(`Host filter initialized`, {
-            mode: result.mode,
-            whitelistCount: result.whitelist.size,
-            blacklistCount: result.blacklist.size,
-        });
-
-        return result;
-    }
-
-    validateHost(host) {
-        if (this.hostFilter.mode === 'disabled') {
-            return { allowed: true, reason: 'Host filtering disabled' };
-        }
-
-        const lowerHost = host.toLowerCase().trim();
-
-        if (this.hostFilter.mode === 'whitelist') {
-            if (this.hostFilter.whitelist.has(lowerHost)) {
-                return { allowed: true, reason: 'Host whitelisted' };
-            }
-            logger.warn('Host blocked: not whitelisted', { host });
-            return { allowed: false, reason: `Host '${host}' not in whitelist` };
-        }
-
-        if (this.hostFilter.mode === 'blacklist') {
-            if (this.hostFilter.blacklist.has(lowerHost)) {
-                logger.warn('Host blocked: blacklisted', { host });
-                return { allowed: false, reason: `Host '${host}' is blacklisted` };
-            }
-            return { allowed: true, reason: 'Host not blacklisted' };
-        }
-
-        return { allowed: true, reason: 'Unknown host filter mode' };
-    }
-
     // ===========================================================================
     // CREDENTIAL RESOLUTION FROM ENV VARS
     // ===========================================================================
@@ -350,19 +246,68 @@ class SSHMCPServer {
     }
 
     /**
+     * Resolve fields from a named profile (env vars: PROFILE_<NAME>_*).
+     * Only fills in fields that are NOT already provided (explicit values always win).
+     */
+    resolveProfile(args) {
+        if (!args.profile) return args;
+
+        const name = args.profile.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '');
+        const resolved = { ...args };
+
+        const mapping = {
+            username:       `PROFILE_${name}_USER`,
+            password:       `PROFILE_${name}_PASSWORD`,
+            enablePassword: `PROFILE_${name}_ENABLE_PASSWORD`,
+            deviceType:     `PROFILE_${name}_DEVICE_TYPE`,
+            jumpCommand:    `PROFILE_${name}_JUMP_COMMAND`,
+            preset:         `PROFILE_${name}_PRESET`,
+        };
+
+        for (const [field, envKey] of Object.entries(mapping)) {
+            if (!resolved[field]) {
+                const envValue = process.env[envKey];
+                if (envValue) {
+                    logger.info(`Profile ${args.profile}: resolved ${field} from ${envKey}`);
+                    resolved[field] = envValue;
+                }
+            }
+        }
+
+        // sshOptions is JSON — parse from env if not already set
+        if (!resolved.sshOptions) {
+            const envKey = `PROFILE_${name}_SSH_OPTIONS`;
+            const envValue = process.env[envKey];
+            if (envValue) {
+                try {
+                    resolved.sshOptions = JSON.parse(envValue);
+                    logger.info(`Profile ${args.profile}: resolved sshOptions from ${envKey}`);
+                } catch (e) {
+                    logger.warn(`Profile ${args.profile}: invalid JSON in ${envKey}`, { error: e.message });
+                }
+            }
+        }
+
+        return resolved;
+    }
+
+    /**
      * Resolve credentials from environment variables based on connectionId.
      *
      * Convention:
      *   connectionId "router1" → ROUTER1_PASSWORD, ROUTER1_ENABLE_PASSWORD, ROUTER1_USERNAME
      *
      * Only fills in fields that are NOT already provided (explicit values always win).
+     * Profile env vars (PROFILE_<NAME>_*) are resolved first if a profile is specified.
      */
     resolveCredentialsFromEnv(args) {
-        const connectionId = args.connectionId;
-        if (!connectionId) return args;
+        // Resolve profile first — profile values are defaults, explicit args win
+        const profiled = this.resolveProfile(args);
+        const connectionId = profiled.connectionId;
+        if (!connectionId) return profiled;
 
         const prefix = this.connectionIdToEnvPrefix(connectionId);
-        const resolved = { ...args };
+        const resolved = { ...profiled };
 
         if (!resolved.password) {
             const envKey = `${prefix}_PASSWORD`;
@@ -559,6 +504,7 @@ class SSHMCPServer {
                         connectionId: item.connectionId || item.connection_id || item.id || item.host,
                         enablePassword: item.enablePassword || item.enable_password || item.enable,
                         sshOptions: item.sshOptions || item.ssh_options || null,
+                        profile: item.profile || null,
                         preset: item.preset || null,
                         jumpCommand: item.jumpCommand || item.jump_command || null,
                         jumpPromptPattern: item.jumpPromptPattern || item.jump_prompt_pattern || null,
@@ -685,7 +631,20 @@ class SSHMCPServer {
         }
 
         // Check full command against whitelist (for multi-word entries)
-        // Note: no early return here — must still check individual commands in pipes/chains below
+        if (this.commandFilter.mode === 'whitelist') {
+            let foundMatch = false;
+            for (const allowed of this.commandFilter.whitelistArray) {
+                if (lowerCmd === allowed ||
+                    lowerCmd.startsWith(allowed + ' ') ||
+                    lowerCmd.startsWith(allowed + '\t')) {
+                    foundMatch = true;
+                    break;
+                }
+            }
+            if (foundMatch) {
+                return { allowed: true, reason: 'Whitelisted (full match)' };
+            }
+        }
 
         // Also check individual base commands in pipes/chains
         const allCommands = this.extractAllCommands(trimmedCmd);
@@ -741,8 +700,9 @@ class SSHMCPServer {
                                     + 'Prefix value with "+" to append to defaults. '
                                     + 'Example: { "KexAlgorithms": "+diffie-hellman-group-exchange-sha1", "HostKeyAlgorithms": "+ssh-rsa" }',
                             },
+                            profile: { type: 'string', description: 'Connection profile name. Resolves PROFILE_<NAME>_USER, _PASSWORD, _SSH_OPTIONS, _JUMP_COMMAND from env vars. Explicit values override profile.' },
                         },
-                        required: ['username'],
+                        required: [],
                     },
                 },
                 {
@@ -773,8 +733,9 @@ class SSHMCPServer {
                                 description: 'SSH -o style options for algorithm negotiation. '
                                     + 'Example: { "KexAlgorithms": "+diffie-hellman-group-exchange-sha1", "HostKeyAlgorithms": "+ssh-rsa" }',
                             },
+                            profile: { type: 'string', description: 'Connection profile name. Resolves PROFILE_<n>_USER, _PASSWORD, _SSH_OPTIONS, _JUMP_COMMAND from env vars.' },
                         },
-                        required: ['host', 'username'],
+                        required: ['host'],
                     },
                 },
                 {
@@ -947,9 +908,6 @@ class SSHMCPServer {
         const host = hostParam || hostname;
         if (!host) throw new Error('host is required');
 
-        const hostCheck = this.validateHost(host);
-        if (!hostCheck.allowed) throw new Error(hostCheck.reason);
-
         if (this.connections.has(connectionId)) {
             throw new Error(`Connection '${connectionId}' already exists`);
         }
@@ -1026,7 +984,6 @@ class SSHMCPServer {
                     shellReady: false,
                     keepaliveCount: 0,
                     connectedAt: Date.now(),
-                    lastActivity: Date.now(),
                 };
 
                 // Start keepalive logging interval
@@ -1222,9 +1179,6 @@ class SSHMCPServer {
         const host = hostParam || hostname;
         if (!host) throw new Error('host is required');
 
-        const hostCheck = this.validateHost(host);
-        if (!hostCheck.allowed) throw new Error(hostCheck.reason);
-
         if (this.connections.has(connectionId)) {
             throw new Error(`Connection '${connectionId}' already exists`);
         }
@@ -1293,7 +1247,6 @@ class SSHMCPServer {
                     shellReady: false,
                     keepaliveCount: 0,
                     connectedAt: Date.now(),
-                    lastActivity: Date.now(),
                 };
 
                 // Start keepalive logging interval
@@ -1460,8 +1413,6 @@ class SSHMCPServer {
             this.connections.delete(connectionId);
             throw new Error(`Connection ${connectionId} was closed by remote host. Please reconnect.`);
         }
-
-        connection.lastActivity = Date.now();
 
         if (['cisco', 'mikrotik', 'juniper', 'network', 'jump_shell'].includes(connection.deviceType)) {
             if (!connection.shell || !connection.shellReady) {
@@ -1728,34 +1679,6 @@ class SSHMCPServer {
     // ===========================================================================
     // DISCONNECT HANDLERS
     // ===========================================================================
-    _checkIdleConnections() {
-        if (this.connections.size === 0) return;
-
-        const now = Date.now();
-        const timeoutMs = this.idleTimeoutSeconds * 1000;
-
-        for (const [connectionId, connInfo] of this.connections) {
-            const idleMs = now - (connInfo.lastActivity || connInfo.connectedAt);
-            if (idleMs >= timeoutMs) {
-                const idleSec = Math.round(idleMs / 1000);
-                logger.warn(`Idle timeout: disconnecting ${connectionId} (idle ${idleSec}s, limit ${this.idleTimeoutSeconds}s)`, {
-                    host: connInfo.host,
-                });
-                try {
-                    if (connInfo.jumpShellActive) {
-                        this.exitJumpShell(connInfo, connectionId).catch(() => {});
-                    }
-                    if (connInfo.keepaliveInterval) clearInterval(connInfo.keepaliveInterval);
-                    if (connInfo.shell) connInfo.shell.end();
-                    connInfo.conn.end();
-                } catch (e) {
-                    logger.debug(`Error during idle disconnect: ${connectionId}`, { error: e.message });
-                }
-                this.connections.delete(connectionId);
-            }
-        }
-    }
-
     async handleSSHDisconnect(args) {
         const { connectionId = 'default' } = args;
 
