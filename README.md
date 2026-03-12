@@ -183,6 +183,33 @@ No passwords in the file. The server resolves `ROUTER1_PASSWORD`, `ROUTER2_PASSW
 ]
 ```
 
+**Profiles:**
+Define reusable connection profiles for connecting to the same type of device with similar settings (e.g. all Cisco switches). 
+Profiles can include default SSH options for legacy devices, so you don't have to repeat them in every connection.
+
+
+***Resolution priority:*** explicit args > profile env vars > connectionId env vars
+
+````bash
+export PROFILE_CISCO_USER=admin
+export PROFILE_CISCO_PASSWORD=secret123
+export PROFILE_CISCO_DEVICE_TYPE=cisco
+export PROFILE_CISCO_SSH_OPTIONS='{"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"}'
+````
+BELOW is an example of how profile env vars are resolved when loading connections from CSV/JSON. The `PROFILE_CISCO_SSH_OPTIONS` value is parsed as JSON and applied to all connections with `deviceType` of `cisco`.
+
+| Env Var  Example              | Field                       |Value                  |
+| ----------------------------- | --------------------------- |-----------------------|
+| PROFILE_CISCO_USER            | username                    | admin                 |
+| PROFILE_CISCO_PASSWORD        | password                    | secret123|
+| PROFILE_CISCO_DEVICE_TYPE     | deviceType                  | cisco|
+| PROFILE_CISCO_SSH_OPTIONS     | sshOptions (parsed as JSON) | {"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"}|
+| PROFILE_CISCO_JUMP_COMMAND    | jumpCommand                 | telnet lh |
+| PROFILE_CISCO_PRESET          | preset                      | topex |
+
+
+`ssh_connect host=10.0.0.1 profile=CISCO connectionId=SWITCH1"`
+
 **Usage:**
 
 ```
