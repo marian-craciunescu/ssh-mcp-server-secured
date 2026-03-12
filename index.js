@@ -106,6 +106,18 @@ const DEFAULT_COMMAND_FILTER = {
 };
 
 // =============================================================================
+// DEFAULT HOST FILTER CONFIGURATION
+// =============================================================================
+// Controls which hosts/IPs are allowed for SSH connections.
+// Env vars: SSH_HOST_FILTER_MODE (disabled|whitelist|blacklist),
+//           SSH_HOST_WHITELIST, SSH_HOST_BLACKLIST (comma-separated or JSON array)
+const DEFAULT_HOST_FILTER = {
+    mode: 'disabled',  // 'disabled', 'whitelist', 'blacklist'
+    whitelist: [],
+    blacklist: [],
+};
+
+// =============================================================================
 // JUMP SHELL PRESETS
 // =============================================================================
 // Built-in configurations for "SSH → enter nested CLI" scenarios.
@@ -144,6 +156,7 @@ class SSHMCPServer {
 
         this.connections = new Map(); // connectionId -> { conn, host, port, username, deviceType, shell, shellBuffer }
         this.commandFilter = this.loadCommandFilter();
+        this.hostFilter = this.loadHostFilter();
         this.setupToolHandlers();
 
         // Idle timeout: disconnect after N seconds of no commands (0 = disabled)
@@ -233,6 +246,90 @@ class SSHMCPServer {
         });
 
         return result;
+    }
+
+    loadHostFilter() {
+        const config = { ...DEFAULT_HOST_FILTER };
+
+        // Load from config file (same ssh-mcp-config.json)
+        const configPaths = [
+            resolve(__dirname, 'ssh-mcp-config.json'),
+            resolve(process.env.HOME || '/root', '.ssh-mcp-config.json'),
+        ];
+        for (const cfgPath of configPaths) {
+            if (existsSync(cfgPath)) {
+                try {
+                    const fileConfig = JSON.parse(readFileSync(cfgPath, 'utf8'));
+                    if (fileConfig.hostFilter) {
+                        Object.assign(config, fileConfig.hostFilter);
+                        logger.info(`Host filter loaded from ${cfgPath}`);
+                    }
+                } catch (e) {
+                    logger.debug(`Could not parse host filter from ${cfgPath}`, { error: e.message });
+                }
+                break;
+            }
+        }
+
+        // Env var overrides
+        if (process.env.SSH_HOST_FILTER_MODE) config.mode = process.env.SSH_HOST_FILTER_MODE;
+
+        if (process.env.SSH_HOST_WHITELIST) {
+            config.whitelist = process.env.SSH_HOST_WHITELIST.startsWith('[')
+                ? JSON.parse(process.env.SSH_HOST_WHITELIST)
+                : process.env.SSH_HOST_WHITELIST.split(',').map(s => s.trim()).filter(Boolean);
+            logger.info(`Loaded host whitelist from env: ${config.whitelist.length} entries`);
+        }
+
+        if (process.env.SSH_HOST_BLACKLIST) {
+            config.blacklist = process.env.SSH_HOST_BLACKLIST.startsWith('[')
+                ? JSON.parse(process.env.SSH_HOST_BLACKLIST)
+                : process.env.SSH_HOST_BLACKLIST.split(',').map(s => s.trim()).filter(Boolean);
+            logger.info(`Loaded host blacklist from env: ${config.blacklist.length} entries`);
+        }
+
+        const normalizedWhitelist = config.whitelist.map(s => s.toLowerCase().trim());
+        const normalizedBlacklist = config.blacklist.map(s => s.toLowerCase().trim());
+
+        const result = {
+            mode: config.mode,
+            whitelist: new Set(normalizedWhitelist),
+            blacklist: new Set(normalizedBlacklist),
+        };
+
+        logger.info(`Host filter initialized`, {
+            mode: result.mode,
+            whitelistCount: result.whitelist.size,
+            blacklistCount: result.blacklist.size,
+        });
+
+        return result;
+    }
+
+    validateHost(host) {
+        if (this.hostFilter.mode === 'disabled') {
+            return { allowed: true, reason: 'Host filtering disabled' };
+        }
+
+        const lowerHost = host.toLowerCase().trim();
+
+        if (this.hostFilter.mode === 'whitelist') {
+            if (this.hostFilter.whitelist.has(lowerHost)) {
+                return { allowed: true, reason: 'Host whitelisted' };
+            }
+            logger.warn('Host blocked: not whitelisted', { host });
+            return { allowed: false, reason: `Host '${host}' not in whitelist` };
+        }
+
+        if (this.hostFilter.mode === 'blacklist') {
+            if (this.hostFilter.blacklist.has(lowerHost)) {
+                logger.warn('Host blocked: blacklisted', { host });
+                return { allowed: false, reason: `Host '${host}' is blacklisted` };
+            }
+            return { allowed: true, reason: 'Host not blacklisted' };
+        }
+
+        return { allowed: true, reason: 'Unknown host filter mode' };
     }
 
     // ===========================================================================
@@ -588,20 +685,7 @@ class SSHMCPServer {
         }
 
         // Check full command against whitelist (for multi-word entries)
-        if (this.commandFilter.mode === 'whitelist') {
-            let foundMatch = false;
-            for (const allowed of this.commandFilter.whitelistArray) {
-                if (lowerCmd === allowed ||
-                    lowerCmd.startsWith(allowed + ' ') ||
-                    lowerCmd.startsWith(allowed + '\t')) {
-                    foundMatch = true;
-                    break;
-                }
-            }
-            if (foundMatch) {
-                return { allowed: true, reason: 'Whitelisted (full match)' };
-            }
-        }
+        // Note: no early return here — must still check individual commands in pipes/chains below
 
         // Also check individual base commands in pipes/chains
         const allCommands = this.extractAllCommands(trimmedCmd);
@@ -862,6 +946,9 @@ class SSHMCPServer {
 
         const host = hostParam || hostname;
         if (!host) throw new Error('host is required');
+
+        const hostCheck = this.validateHost(host);
+        if (!hostCheck.allowed) throw new Error(hostCheck.reason);
 
         if (this.connections.has(connectionId)) {
             throw new Error(`Connection '${connectionId}' already exists`);
@@ -1134,6 +1221,9 @@ class SSHMCPServer {
 
         const host = hostParam || hostname;
         if (!host) throw new Error('host is required');
+
+        const hostCheck = this.validateHost(host);
+        if (!hostCheck.allowed) throw new Error(hostCheck.reason);
 
         if (this.connections.has(connectionId)) {
             throw new Error(`Connection '${connectionId}' already exists`);
