@@ -387,6 +387,7 @@ Log format:
 | `SSH_HOST_WHITELIST` | comma-separated IPs | - | Whitelist of allowed host IPs |
 | `SSH_HOST_BLACKLIST` | comma-separated IPs | - | Blacklist of allowed host IPs |
 | `SSH_IDLE_TIMEOUT` | seconds | 120 | Idle connection timeout |
+|`SSH_FAILED_CONNECTIONS_LOG`|file  path |  ./ssh-failed-connections.json |/var/log/ssh-failed.jsonl |
 
 
 Any additional environment variables following the `<CONNECTIONID>_PASSWORD` convention are automatically used for credential resolution (see [Credential Resolution Convention](#credential-resolution-convention)).
