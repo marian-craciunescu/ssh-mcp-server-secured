@@ -146,6 +146,13 @@ class SSHMCPServer {
         this.commandFilter = this.loadCommandFilter();
         this.setupToolHandlers();
 
+        // Idle timeout: disconnect after N seconds of no commands (0 = disabled)
+        this.idleTimeoutSeconds = parseInt(process.env.SSH_IDLE_TIMEOUT || '120', 10);
+        if (this.idleTimeoutSeconds > 0) {
+            this._idleCheckInterval = setInterval(() => this._checkIdleConnections(), 30000);
+            logger.info(`Idle timeout enabled: ${this.idleTimeoutSeconds}s`);
+        }
+
         logger.info('SSH MCP Server initialized', { version: packageJson.version });
     }
 
@@ -932,6 +939,7 @@ class SSHMCPServer {
                     shellReady: false,
                     keepaliveCount: 0,
                     connectedAt: Date.now(),
+                    lastActivity: Date.now(),
                 };
 
                 // Start keepalive logging interval
@@ -1195,6 +1203,7 @@ class SSHMCPServer {
                     shellReady: false,
                     keepaliveCount: 0,
                     connectedAt: Date.now(),
+                    lastActivity: Date.now(),
                 };
 
                 // Start keepalive logging interval
@@ -1361,6 +1370,8 @@ class SSHMCPServer {
             this.connections.delete(connectionId);
             throw new Error(`Connection ${connectionId} was closed by remote host. Please reconnect.`);
         }
+
+        connection.lastActivity = Date.now();
 
         if (['cisco', 'mikrotik', 'juniper', 'network', 'jump_shell'].includes(connection.deviceType)) {
             if (!connection.shell || !connection.shellReady) {
@@ -1627,6 +1638,34 @@ class SSHMCPServer {
     // ===========================================================================
     // DISCONNECT HANDLERS
     // ===========================================================================
+    _checkIdleConnections() {
+        if (this.connections.size === 0) return;
+
+        const now = Date.now();
+        const timeoutMs = this.idleTimeoutSeconds * 1000;
+
+        for (const [connectionId, connInfo] of this.connections) {
+            const idleMs = now - (connInfo.lastActivity || connInfo.connectedAt);
+            if (idleMs >= timeoutMs) {
+                const idleSec = Math.round(idleMs / 1000);
+                logger.warn(`Idle timeout: disconnecting ${connectionId} (idle ${idleSec}s, limit ${this.idleTimeoutSeconds}s)`, {
+                    host: connInfo.host,
+                });
+                try {
+                    if (connInfo.jumpShellActive) {
+                        this.exitJumpShell(connInfo, connectionId).catch(() => {});
+                    }
+                    if (connInfo.keepaliveInterval) clearInterval(connInfo.keepaliveInterval);
+                    if (connInfo.shell) connInfo.shell.end();
+                    connInfo.conn.end();
+                } catch (e) {
+                    logger.debug(`Error during idle disconnect: ${connectionId}`, { error: e.message });
+                }
+                this.connections.delete(connectionId);
+            }
+        }
+    }
+
     async handleSSHDisconnect(args) {
         const { connectionId = 'default' } = args;
 
