@@ -613,6 +613,7 @@ class SSHMCPServer {
                         jumpPromptPattern: item.jumpPromptPattern || item.jump_prompt_pattern || null,
                         jumpExitCommand: item.jumpExitCommand || item.jump_exit_command || null,
                         jumpReadyTimeout: item.jumpReadyTimeout || item.jump_ready_timeout || null,
+                        useAgent: !!(item.useAgent || item.use_agent),
                     });
                 }
                 logger.info(`Parsed JSON file: ${connections.length} connections`);
@@ -780,6 +781,7 @@ class SSHMCPServer {
                             password: { type: 'string', description: 'Password' },
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
+                            useAgent: { type: 'boolean', description: 'Use local SSH agent for authentication (requires SSH_AUTH_SOCK env var)', default: false },
                             connectionId: { type: 'string', description: 'Unique connection ID', default: 'default' },
                             deviceType: { type: 'string', description: 'Device type: linux, cisco, mikrotik, juniper', default: 'linux' },
                             enablePassword: { type: 'string', description: 'Enable password for Cisco devices' },
@@ -812,6 +814,7 @@ class SSHMCPServer {
                             password: { type: 'string', description: 'SSH password' },
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
+                            useAgent: { type: 'boolean', description: 'Use local SSH agent for authentication (requires SSH_AUTH_SOCK env var)', default: false },
                             connectionId: { type: 'string', description: 'Unique connection ID', default: 'default' },
                             preset: { type: 'string', description: 'Built-in preset: freeswitch, topex. Auto-fills jump config where possible.' },
                             jumpCommand: { type: 'string', description: 'Command to enter nested shell (e.g. "telnet lh", "fs_cli").' },
@@ -1003,6 +1006,7 @@ class SSHMCPServer {
             password,
             privateKey,
             passphrase,
+            useAgent = false,
             connectionId = 'default',
             deviceType = 'linux',
             enablePassword,
@@ -1051,6 +1055,10 @@ class SSHMCPServer {
                 logger.info(`SSH algorithms configured`, { connectionId, algorithms });
             }
 
+            if (useAgent) {
+                config.agent = process.env.SSH_AUTH_SOCK || (process.platform === 'win32' ? 'pageant' : undefined);
+            }
+
             logger.debug(`Connection config`, {
                 connectionId,
                 host: config.host,
@@ -1069,8 +1077,8 @@ class SSHMCPServer {
                 }
             } else if (password) {
                 config.password = password;
-            } else {
-                return reject(new Error('Either password or privateKey required. Set <CONNECTIONID>_PASSWORD env var or provide password directly.'));
+            } else if (!config.agent) {
+                return reject(new Error('Either password, privateKey, or useAgent required. Set <CONNECTIONID>_PASSWORD env var or provide password/key directly.'));
             }
 
             conn.on('ready', async () => {
@@ -1281,6 +1289,7 @@ class SSHMCPServer {
             password,
             privateKey,
             passphrase,
+            useAgent = false,
             connectionId = 'default',
             sshOptions,
         } = resolved;
@@ -1328,6 +1337,10 @@ class SSHMCPServer {
                 logger.info(`SSH algorithms configured`, { connectionId, algorithms });
             }
 
+            if (useAgent) {
+                config.agent = process.env.SSH_AUTH_SOCK || (process.platform === 'win32' ? 'pageant' : undefined);
+            }
+
             if (resolvedKeyPath) {
                 try {
                     config.privateKey = readFileSync(resolvedKeyPath);
@@ -1337,8 +1350,8 @@ class SSHMCPServer {
                 }
             } else if (password) {
                 config.password = password;
-            } else {
-                return reject(new Error('Either password or privateKey required. Set <CONNECTIONID>_PASSWORD env var or provide password directly.'));
+            } else if (!config.agent) {
+                return reject(new Error('Either password, privateKey, or useAgent required. Set <CONNECTIONID>_PASSWORD env var or provide password/key directly.'));
             }
 
             conn.on('ready', async () => {
