@@ -486,7 +486,8 @@ Log format:
 | `SSH_HOST_WHITELIST` | comma-separated IPs | - | Whitelist of allowed host IPs |
 | `SSH_HOST_BLACKLIST` | comma-separated IPs | - | Blacklist of allowed host IPs |
 | `SSH_IDLE_TIMEOUT` | seconds | 120 | Idle connection timeout |
-|`SSH_FAILED_CONNECTIONS_LOG`|file  path |  ./ssh-failed-connections.json |/var/log/ssh-failed.jsonl |
+| `SSH_FAILED_CONNECTIONS_LOG`|file  path |  ./ssh-failed-connections.json |/var/log/ssh-failed.jsonl |
+| `SSH_ALLOW_PRIVATE_KEY_ACCESS` | `true`, `false` | `false` | When `true`, disables the SFTP restriction that prevents uploading/downloading the private key file used by a connection |
 
 
 Any additional environment variables following the `<CONNECTIONID>_PASSWORD` convention are automatically used for credential resolution (see [Credential Resolution Convention](#credential-resolution-convention)).
@@ -984,7 +985,12 @@ npx @modelcontextprotocol/inspector node index.js
 
 ## API Reference
 
-For detailed API documentation of all available tools and their parameters, see the [Examples](#examples) section above.
+* **Default is blacklist mode** — provides protection while remaining flexible
+* **Dangerous patterns are always checked** — even in disabled mode
+* **Audit logging enabled by default** — track blocked attempts
+* **Sudo can be restricted** — set `SSH_ALLOW_SUDO=false` for high-security environments
+* **Credential isolation** — passwords are resolved from env vars by connectionId, never typed in chat or visible in tool calls
+* **Private key protection** — SFTP upload/download operations are blocked from accessing the private key file used for the connection. Set `SSH_ALLOW_PRIVATE_KEY_ACCESS=true` to disable this safeguard if you need to transfer key files intentionally
 
 ## License
 
