@@ -367,6 +367,9 @@ class SSHMCPServer {
             preset: `PROFILE_${name}_PRESET`,
             privateKey: `PROFILE_${name}_PRIVATE_KEY`,
             passphrase: `PROFILE_${name}_PRIVATE_KEY_PASSPHRASE`,
+            sshAgent: `PROFILE_${name}_AGENT_ENABLED`,
+            sshAgentForward: `PROFILE_${name}_AGENT_FORWARD`,
+            sshAgentSocket: `PROFILE_${name}_AGENT_SOCKET`,
         };
 
         for (const [field, envKey] of Object.entries(mapping)) {
@@ -391,6 +394,14 @@ class SSHMCPServer {
                     logger.warn(`Profile ${args.profile}: invalid JSON in ${envKey}`, { error: e.message });
                 }
             }
+        }
+
+        // Convert string environment booleans to actual booleans
+        if (typeof resolved.sshAgent === 'string') {
+            resolved.sshAgent = resolved.sshAgent === 'true' || resolved.sshAgent === '1';
+        }
+        if (typeof resolved.sshAgentForward === 'string') {
+            resolved.sshAgentForward = resolved.sshAgentForward === 'true' || resolved.sshAgentForward === '1';
         }
 
         return resolved;
@@ -458,6 +469,33 @@ class SSHMCPServer {
             if (envValue) {
                 logger.info(`Resolved privateKey passphrase from env: ${envKey}`);
                 resolved.passphrase = envValue;
+            }
+        }
+
+        if (resolved.sshAgent === undefined) {
+            const envKey = `${prefix}_AGENT_ENABLED`;
+            const envValue = process.env[envKey];
+            if (envValue !== undefined) {
+                logger.info(`Resolved sshAgent from env: ${envKey}`);
+                resolved.sshAgent = envValue === 'true' || envValue === '1';
+            }
+        }
+
+        if (resolved.sshAgentForward === undefined) {
+            const envKey = `${prefix}_AGENT_FORWARD`;
+            const envValue = process.env[envKey];
+            if (envValue !== undefined) {
+                logger.info(`Resolved sshAgentForward from env: ${envKey}`);
+                resolved.sshAgentForward = envValue === 'true' || envValue === '1';
+            }
+        }
+
+        if (resolved.sshAgentSocket === undefined) {
+            const envKey = `${prefix}_AGENT_SOCKET`;
+            const envValue = process.env[envKey];
+            if (envValue !== undefined) {
+                logger.info(`Resolved sshAgentSocket from env: ${envKey}`);
+                resolved.sshAgentSocket = envValue;
             }
         }
 
@@ -633,8 +671,8 @@ class SSHMCPServer {
                         jumpPromptPattern: item.jumpPromptPattern || item.jump_prompt_pattern || null,
                         jumpExitCommand: item.jumpExitCommand || item.jump_exit_command || null,
                         jumpReadyTimeout: item.jumpReadyTimeout || item.jump_ready_timeout || null,
-                        useAgent: !!(item.useAgent || item.use_agent),
-                        agentForward: !!(item.agentForward || item.agent_forward),
+                        sshAgent: !!(item.sshAgent || item.use_agent),
+                        sshAgentForward: !!(item.sshAgentForward || item.agent_forward),
                     });
                 }
                 logger.info(`Parsed JSON file: ${connections.length} connections`);
@@ -802,8 +840,9 @@ class SSHMCPServer {
                             password: { type: 'string', description: 'Password' },
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
-                            useAgent: { type: 'boolean', description: 'Use local SSH agent for authentication. On Windows, uses SSH_AUTH_SOCK if set, otherwise defaults to pageant.', default: false },
-                            agentForward: { type: 'boolean', description: 'Forward SSH agent to the remote server', default: false },
+                            sshAgent: { type: 'boolean', description: 'Use local SSH agent for authentication. On Windows, uses SSH_AUTH_SOCK if set, otherwise defaults to pageant.', default: false },
+                            sshAgentSocket: { type: 'string', description: 'Custom path to SSH agent socket (overrides global SSH_AUTH_SOCK environment variable)' },
+                            sshAgentForward: { type: 'boolean', description: 'Forward SSH agent to the remote server', default: false },
                             connectionId: { type: 'string', description: 'Unique connection ID', default: 'default' },
                             deviceType: { type: 'string', description: 'Device type: linux, cisco, mikrotik, juniper', default: 'linux' },
                             enablePassword: { type: 'string', description: 'Enable password for Cisco devices' },
@@ -836,8 +875,8 @@ class SSHMCPServer {
                             password: { type: 'string', description: 'SSH password' },
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
-                            useAgent: { type: 'boolean', description: 'Use local SSH agent for authentication. On Windows, uses SSH_AUTH_SOCK if set, otherwise defaults to pageant.', default: false },
-                            agentForward: { type: 'boolean', description: 'Forward SSH agent to the remote server. Defaults to true if useAgent is true for jump connections.', default: false },
+                            sshAgent: { type: 'boolean', description: 'Use local SSH agent for authentication. On Windows, uses SSH_AUTH_SOCK if set, otherwise defaults to pageant.', default: false },
+                            sshAgentForward: { type: 'boolean', description: 'Forward SSH agent to the remote server. Defaults to true if sshAgent is true for jump connections.', default: false },
                             connectionId: { type: 'string', description: 'Unique connection ID', default: 'default' },
                             preset: { type: 'string', description: 'Built-in preset: freeswitch, topex. Auto-fills jump config where possible.' },
                             jumpCommand: { type: 'string', description: 'Command to enter nested shell (e.g. "telnet lh", "fs_cli").' },
@@ -1029,8 +1068,9 @@ class SSHMCPServer {
             password,
             privateKey,
             passphrase,
-            useAgent = false,
-            agentForward: agentForwardParam,
+            sshAgent = false,
+            sshAgentSocket,
+            sshAgentForward: sshAgentForwardParam,
             connectionId = 'default',
             deviceType = 'linux',
             enablePassword,
@@ -1038,7 +1078,7 @@ class SSHMCPServer {
         } = resolved;
 
         const host = hostParam || hostname;
-        const agentForward = agentForwardParam !== undefined ? agentForwardParam : false;
+        const sshAgentForward = sshAgentForwardParam !== undefined ? sshAgentForwardParam : false;
         if (!host) throw new Error('host is required');
 
         const hostCheck = this.validateHost(host);
@@ -1080,11 +1120,11 @@ class SSHMCPServer {
                 logger.info(`SSH algorithms configured`, { connectionId, algorithms });
             }
 
-            if (useAgent) {
-                config.agent = process.env.SSH_AUTH_SOCK || (process.platform === 'win32' ? 'pageant' : undefined);
+            if (sshAgent) {
+                config.agent = sshAgentSocket || process.env.SSH_AUTH_SOCK || (process.platform === 'win32' ? 'pageant' : undefined);
             }
-            if (agentForward) {
-                config.agentForward = true;
+            if (sshAgentForward) {
+                config.sshAgentForward = true;
             }
 
             logger.debug(`Connection config`, {
@@ -1106,7 +1146,7 @@ class SSHMCPServer {
             } else if (password) {
                 config.password = password;
             } else if (!config.agent) {
-                return reject(new Error('Either password, privateKey, or useAgent required. Set <CONNECTIONID>_PASSWORD env var or provide password/key directly.'));
+                return reject(new Error('Either password, privateKey, or sshAgent required. Set <CONNECTIONID>_PASSWORD env var or provide password/key directly.'));
             }
 
             conn.on('ready', async () => {
@@ -1173,7 +1213,7 @@ class SSHMCPServer {
                 this._logFailedConnection({ host, port, username, connectionId, error: error.message, level: error.level, code: error.code });
 
                 let errorMsg = `SSH connection failed: ${error.message}`;
-                if (useAgent && process.platform === 'win32' && !process.env.SSH_AUTH_SOCK) {
+                if (sshAgent && process.platform === 'win32' && !process.env.SSH_AUTH_SOCK) {
                     errorMsg += ' (Hint: Pageant auth failed. Is Pageant running with your keys loaded? Alternatively, set the SSH_AUTH_SOCK environment variable to point to your agent socket.)';
                 }
                 reject(new Error(errorMsg));
@@ -1323,14 +1363,15 @@ class SSHMCPServer {
             password,
             privateKey,
             passphrase,
-            useAgent = false,
-            agentForward: agentForwardParam,
+            sshAgent = false,
+            sshAgentSocket,
+            sshAgentForward: sshAgentForwardParam,
             connectionId = 'default',
             sshOptions,
         } = resolved;
 
         const host = hostParam || hostname;
-        const agentForward = agentForwardParam !== undefined ? agentForwardParam : false;
+        const sshAgentForward = sshAgentForwardParam !== undefined ? sshAgentForwardParam : false;
         if (!host) throw new Error('host is required');
 
         const hostCheck = this.validateHost(host);
@@ -1373,11 +1414,11 @@ class SSHMCPServer {
                 logger.info(`SSH algorithms configured`, { connectionId, algorithms });
             }
 
-            if (useAgent) {
-                config.agent = process.env.SSH_AUTH_SOCK || (process.platform === 'win32' ? 'pageant' : undefined);
+            if (sshAgent) {
+                config.agent = sshAgentSocket || process.env.SSH_AUTH_SOCK || (process.platform === 'win32' ? 'pageant' : undefined);
             }
-            if (agentForward) {
-                config.agentForward = true;
+            if (sshAgentForward) {
+                config.sshAgentForward = true;
             }
 
             if (resolvedKeyPath) {
@@ -1390,7 +1431,7 @@ class SSHMCPServer {
             } else if (password) {
                 config.password = password;
             } else if (!config.agent) {
-                return reject(new Error('Either password, privateKey, or useAgent required. Set <CONNECTIONID>_PASSWORD env var or provide password/key directly.'));
+                return reject(new Error('Either password, privateKey, or sshAgent required. Set <CONNECTIONID>_PASSWORD env var or provide password/key directly.'));
             }
 
             conn.on('ready', async () => {
@@ -1465,7 +1506,7 @@ class SSHMCPServer {
                 this._logFailedConnection({ host, port, username, connectionId, error: error.message, level: error.level, code: error.code });
 
                 let errorMsg = `SSH connection failed: ${error.message}`;
-                if (useAgent && process.platform === 'win32' && !process.env.SSH_AUTH_SOCK) {
+                if (sshAgent && process.platform === 'win32' && !process.env.SSH_AUTH_SOCK) {
                     errorMsg += ' (Hint: Pageant auth failed. Is Pageant running with your keys loaded? Alternatively, set the SSH_AUTH_SOCK environment variable to point to your agent socket.)';
                 }
                 reject(new Error(errorMsg));

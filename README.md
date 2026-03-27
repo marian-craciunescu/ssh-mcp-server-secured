@@ -176,7 +176,9 @@ The connectionId is converted to an env var prefix: uppercased, non-alphanumeric
 | `my-connection` | `MY_CONNECTION_PASSWORD` | `MY_CONNECTION_ENABLE_PASSWORD` |
 | `dc1.switch.3` | `DC1_SWITCH_3_PASSWORD` | `DC1_SWITCH_3_ENABLE_PASSWORD` |
 
-Optionally, `<PREFIX>_USERNAME` is also resolved if username is not provided.
+Optionally, `<PREFIX>_USERNAME` is also resolved if username is not provided. 
+
+> **See all parameters:** For a complete list of supported variables (including Private Keys and SSH Agents), see the [Parameter & Environment Reference](#parameter--environment-reference) below.
 
 Set credentials in your MCP configuration:
 
@@ -303,6 +305,10 @@ BELOW is an example of how profile env vars are resolved when loading connection
 | PROFILE_CISCO_PASSWORD        | password                    | secret123             |
 | PROFILE_CISCO_PRIVATE_KEY     | privateKey                  | `/home/user/.ssh/noc_rsa` |
 | PROFILE_CISCO_PRIVATE_KEY_PASSPHRASE    | passphrase        | `key_secret_123`      |
+| PROFILE_DEV_PRIVATE_KEY_PASSPHRASE    | passphrase        | `key_secret_123`      |
+| PROFILE_DEV_AGENT_ENABLED      | sshAgent                   | `true`                |
+| PROFILE_DEV_AGENT_SOCKET   | sshAgentSocket             | `/tmp/ssh-agent-work.sock` |
+| PROFILE_DEV_AGENT_FORWARD  | sshAgentForward               | `true`                |
 | PROFILE_CISCO_DEVICE_TYPE     | deviceType                  | cisco                 |
 | PROFILE_CISCO_SSH_OPTIONS     | sshOptions (parsed as JSON) | {"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"} |
 | PROFILE_CISCO_JUMP_COMMAND    | jumpCommand                 | telnet lh             |
@@ -314,11 +320,6 @@ Instead of setting credentials for every single server, you can create a reusabl
 2. Connect using: `ssh_connect(host="10.0.0.1", profile="DEV")`.
 3. Connect to another: `ssh_connect(host="10.0.0.2", profile="DEV")`.
 Both will use the same key and passphrase.
-| `_PASSWORD` | SSH password for the user | `PROFILE_CISCO_PASSWORD` |
-| `_PRIVATE_KEY` | Path to an SSH private key file on your machine | `PROFILE_CISCO_PRIVATE_KEY` |
-| `_PRIVATE_KEY_PASSPHRASE` | Passphrase to unlock the private key (if encrypted) | `PROFILE_CISCO_PRIVATE_KEY_PASSPHRASE` |
-| `_USERNAME` | SSH username (if not provided in the tool call) | `PROFILE_CISCO_USERNAME` |
-| `_ENABLE_PASSWORD`| Cisco enable mode password | `PROFILE_CISCO_ENABLE_PASSWORD` |
 
 `ssh_connect host=10.0.0.1 profile=CISCO connectionId=SWITCH1"`
 
@@ -329,6 +330,25 @@ Load connections from /path/to/connections.csv and connect to all
 ```
 
 > **Note:** You can still provide passwords directly in CSV/JSON if preferred — env var resolution only kicks in when the password field is missing or empty.
+
+### Parameter & Environment Reference
+
+The following table summarizes all supported parameters and their corresponding environment variable prefixes for both **Connection IDs** and **Profiles**:
+
+| Parameter | Variable Suffix | Example `connectionId: SERVER1` | Example `profile: WORK` | Description |
+|---|---|---|---|---|
+| `username` | `_USERNAME` / `_USER` | `SERVER1_USERNAME=root` | `PROFILE_WORK_USER=root` | SSH username to log in with. |
+| `password` | `_PASSWORD` | `SERVER1_PASSWORD=password` | `PROFILE_WORK_PASSWORD=password` | SSH password for the user. |
+| `privateKey` | `_PRIVATE_KEY` | `SERVER1_PRIVATE_KEY=/path/to/key` | `PROFILE_WORK_PRIVATE_KEY=/path/to/key` | Path to a local private key file. |
+| `passphrase` | `_PRIVATE_KEY_PASSPHRASE` | `SERVER1_PRIVATE_KEY_PASSPHRASE=passphrase` | `PROFILE_WORK_PRIVATE_KEY_PASSPHRASE=passphrase` | Passphrase to unlock an encrypted key. |
+| `sshAgent` | `_AGENT_ENABLED` | `SERVER1_AGENT_ENABLED=true` | `PROFILE_WORK_AGENT_ENABLED=true` | Set to `true` to use an SSH agent. |
+| `sshAgentSocket` | `_AGENT_SOCKET` | `SERVER1_AGENT_SOCKET=/path/to/socket` | `PROFILE_WORK_AGENT_SOCKET=pagent` | Custom path to an SSH agent socket. |
+| `sshAgentForward` | `_AGENT_FORWARD` | `SERVER1_AGENT_FORWARD=true` | `PROFILE_WORK_AGENT_FORWARD=true` | Set to `true` to forward your agent. |
+| `enablePassword`| `_ENABLE_PASSWORD` | `SERVER1_ENABLE_PASSWORD` | `PROFILE_WORK_ENABLE_PASSWORD` | Cisco/network enable mode password. |
+| `deviceType` | `_DEVICE_TYPE` | *N/A* | `PROFILE_WORK_DEVICE_TYPE` | `linux`, `cisco`, `mikrotik`, etc. |
+| `sshOptions` | `_SSH_OPTIONS` | *N/A* | `PROFILE_WORK_SSH_OPTIONS` | JSON for legacy algorithm settings. |
+
+---
 
 ### 3. Network Device Types
 
