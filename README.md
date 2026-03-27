@@ -254,7 +254,7 @@ host,username,port,deviceType,connectionId
 192.168.1.1,root,22,linux,server1
 ```
 
-No passwords in the file. The server resolves `ROUTER1_PASSWORD`, `ROUTER2_PASSWORD`, `SERVER1_PASSWORD` from env vars.
+No passwords in the file. The server resolves `ROUTER1_PASSWORD`, `ROUTER2_PASSWORD`, `SERVER1_PASSWORD`, `SERVER2_PRIVATE_KEY`, `SERVER2_PRIVATE_KEY_PASSPHRASE` from env vars.
 
 >**NOTE**: CSV can't carry objects so SSH options for legacy devices must be set via individual env vars or in JSON file.
 
@@ -300,12 +300,25 @@ BELOW is an example of how profile env vars are resolved when loading connection
 | Env Var  Example              | Field                       |Value                  |
 | ----------------------------- | --------------------------- |-----------------------|
 | PROFILE_CISCO_USER            | username                    | admin                 |
-| PROFILE_CISCO_PASSWORD        | password                    | secret123|
-| PROFILE_CISCO_DEVICE_TYPE     | deviceType                  | cisco|
-| PROFILE_CISCO_SSH_OPTIONS     | sshOptions (parsed as JSON) | {"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"}|
-| PROFILE_CISCO_JUMP_COMMAND    | jumpCommand                 | telnet lh |
-| PROFILE_CISCO_PRESET          | preset                      | topex |
+| PROFILE_CISCO_PASSWORD        | password                    | secret123             |
+| PROFILE_CISCO_PRIVATE_KEY     | privateKey                  | `/home/user/.ssh/noc_rsa` |
+| PROFILE_CISCO_PRIVATE_KEY_PASSPHRASE    | passphrase        | `key_secret_123`      |
+| PROFILE_CISCO_DEVICE_TYPE     | deviceType                  | cisco                 |
+| PROFILE_CISCO_SSH_OPTIONS     | sshOptions (parsed as JSON) | {"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"} |
+| PROFILE_CISCO_JUMP_COMMAND    | jumpCommand                 | telnet lh             |
+| PROFILE_CISCO_PRESET          | preset                      | topex                 |
 
+**Reusable Profile Example:**
+Instead of setting credentials for every single server, you can create a reusable profile:
+1. Set `PROFILE_DEV_PRIVATE_KEY` and `PROFILE_DEV_PRIVATE_KEY_PASSPHRASE` in your environment.
+2. Connect using: `ssh_connect(host="10.0.0.1", profile="DEV")`.
+3. Connect to another: `ssh_connect(host="10.0.0.2", profile="DEV")`.
+Both will use the same key and passphrase.
+| `_PASSWORD` | SSH password for the user | `PROFILE_CISCO_PASSWORD` |
+| `_PRIVATE_KEY` | Path to an SSH private key file on your machine | `PROFILE_CISCO_PRIVATE_KEY` |
+| `_PRIVATE_KEY_PASSPHRASE` | Passphrase to unlock the private key (if encrypted) | `PROFILE_CISCO_PRIVATE_KEY_PASSPHRASE` |
+| `_USERNAME` | SSH username (if not provided in the tool call) | `PROFILE_CISCO_USERNAME` |
+| `_ENABLE_PASSWORD`| Cisco enable mode password | `PROFILE_CISCO_ENABLE_PASSWORD` |
 
 `ssh_connect host=10.0.0.1 profile=CISCO connectionId=SWITCH1"`
 

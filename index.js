@@ -365,6 +365,8 @@ class SSHMCPServer {
             deviceType: `PROFILE_${name}_DEVICE_TYPE`,
             jumpCommand: `PROFILE_${name}_JUMP_COMMAND`,
             preset: `PROFILE_${name}_PRESET`,
+            privateKey: `PROFILE_${name}_PRIVATE_KEY`,
+            passphrase: `PROFILE_${name}_PRIVATE_KEY_PASSPHRASE`,
         };
 
         for (const [field, envKey] of Object.entries(mapping)) {
@@ -438,6 +440,24 @@ class SSHMCPServer {
             if (envValue) {
                 logger.info(`Resolved username from env: ${envKey}`);
                 resolved.username = envValue;
+            }
+        }
+
+        if (!resolved.privateKey) {
+            const envKey = `${prefix}_PRIVATE_KEY`;
+            const envValue = process.env[envKey];
+            if (envValue) {
+                logger.info(`Resolved privateKey from env: ${envKey}`);
+                resolved.privateKey = envValue;
+            }
+        }
+
+        if (!resolved.passphrase) {
+            const envKey = `${prefix}_PRIVATE_KEY_PASSPHRASE`;
+            const envValue = process.env[envKey];
+            if (envValue) {
+                logger.info(`Resolved privateKey passphrase from env: ${envKey}`);
+                resolved.passphrase = envValue;
             }
         }
 
