@@ -104,3 +104,4 @@ id_rsa*
 *.ppk
 *.zip
 *.dxt
+ssh-failed-connections.jsonl
