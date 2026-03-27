@@ -19,30 +19,129 @@ A **secured** fork of [zibdie/SSH-MCP-Server](https://github.com/zibdie/SSH-MCP-
 * **Configurable Security Policies**: Via config file or environment variables
 * **Audit Logging**: Log all blocked command attempts
 
-## Installation
+## Original zibdie/ssh-mcp-server-secured Features
+
+- **Cross-platform compatibility**: Works on Windows, macOS, and Linux
+- **Multiple authentication methods**: Username/password and SSH key and agent authentication 
+- **IPv4 and IPv6 support**: Connect to servers using either IP version
+- **Multiple connections**: Manage multiple SSH connections simultaneously
+- **Comprehensive file operations**: Upload, download, and list files via SFTP
+- **Script execution**: Run bash, python, and other scripts remotely
+- **Secure**: Uses the robust `ssh2` library for secure connections
+- **MCP compatible**: Works with Claude CLI, Claude Desktop, and other MCP clients
+
+## Installation & Setup
 
 ### Quick Setup (Recommended)
 
-```bash
-# Add to Claude CLI
-claude mcp add ssh-mcp-secured npx '@marian-craciunescu/ssh-mcp-server-secured@latest'
-```
+1. **Add to Claude CLI with one command (cross-platform):**
 
-### Manual Installation
+   ```bash
+   npx @marian-craciunescu/ssh-mcp-server-secured@latest --install
+   ```
 
-```bash
-npm install -g @marian-craciunescu/ssh-mcp-server-secured
-```
+   This auto-detects your OS and registers the MCP server with the correct configuration for your platform.
 
-```json
-{
-  "mcpServers": {
-    "ssh-mcp-secured": {
-      "command": "ssh-mcp-server-secured"
-    }
-  }
-}
-```
+   **Or manually, if you prefer:**
+
+   **macOS/Linux:**
+   ```bash
+   claude mcp add ssh-mcp-secured npx '@marian-craciunescu/ssh-mcp-server-secured@latest'
+   ```
+
+   **Windows:**
+   ```bash
+   claude mcp add ssh-mcp-secured -- cmd /c npx @marian-craciunescu/ssh-mcp-server-secured@latest
+   ```
+
+   > **Why the difference?** On Windows, `npx` is a batch file (`npx.cmd`). Claude Code launches MCP servers using Node.js `child_process.spawn()`, which cannot execute `.cmd` files directly. The `cmd /c` wrapper tells Windows to run it through the command interpreter.
+
+2. **Restart Claude CLI**
+
+3. **Test the connection:**
+   ```
+   "Connect to my server at example.com with username myuser"
+   ```
+
+### Alternative: Manual Installation
+
+#### For Claude CLI
+
+1. **Install globally:**
+
+   ```bash
+   npm install -g @marian-craciunescu/ssh-mcp-server-secured
+   ```
+
+2. **Add to configuration:**
+
+   **macOS/Linux**: Edit `~/.config/claude/claude_desktop_config.json`
+
+   ```json
+   {
+     "mcpServers": {
+       "ssh-mcp-secured": {
+         "command": "ssh-mcp-server-secured"
+       }
+     }
+   }
+   ```
+
+   **Windows**: Edit `%APPDATA%\Claude\claude_desktop_config.json`
+
+   ```json
+   {
+     "mcpServers": {
+       "ssh-mcp-secured": {
+         "command": "cmd",
+         "args": ["/c", "ssh-mcp-server-secured"]
+       }
+     }
+   }
+   ```
+
+#### For Claude Desktop
+
+1. **Install globally:**
+
+   ```bash
+   npm install -g @marian-craciunescu/ssh-mcp-server-secured
+   ```
+
+2. **Add to configuration:**
+
+   **macOS**: Edit `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+   ```json
+   {
+     "mcpServers": {
+       "ssh-mcp-secured": {
+         "command": "ssh-mcp-server-secured"
+       }
+     }
+   }
+   ```
+
+   **Windows**: Edit `%APPDATA%\Claude\claude_desktop_config.json`
+
+   ```json
+   {
+     "mcpServers": {
+       "ssh-mcp-secured": {
+         "command": "cmd",
+         "args": ["/c", "ssh-mcp-server-secured"]
+       }
+     }
+   }
+   ```
+
+## Demo
+
+Here's an example of the SSH MCP server in action, showing file upload capabilities:
+
+![SSH MCP Server Demo](demo_photo.png)
+
+_Example: Uploading and managing files on remote servers through Claude using the SSH MCP server_
 
 ## Usage
 
@@ -549,23 +648,169 @@ These patterns are **always blocked** regardless of filter mode:
 
 ## Available Tools
 
-| Tool | Description |
-|------|-------------|
-| `ssh_connect` | Connect to a single host (password auto-resolved from `<CONNECTIONID>_PASSWORD` env var) , supports `sshOptions` for legacy algorithm negotiation) |
-| `ssh_connect_with_jump_command` | SSH into a host, then enter a nested CLI (telnet, fs_cli, etc.) via a jump command. Supports presets. |
-| `ssh_load_connections` | Load connections from CSV/JSON file (credentials resolved from env vars per connectionId) |
-| `ssh_execute` | Execute a command on one connection |
-| `ssh_cisco_enable` | Enter Cisco privileged EXEC mode (interactive enable password handling) |
-| `ssh_execute_on_multiple` | Execute a command on selected connections (`["*"]` = all) |
-| `ssh_disconnect` | Disconnect one connection |
-| `ssh_disconnect_all` | Disconnect all connections |
-| `ssh_list_connections` | List active connections with status |
-| `ssh_check_connections` | Health check all connections (dead socket detection, shell status) |
-| `ssh_upload_file` | Upload file via SFTP |
-| `ssh_download_file` | Download file via SFTP |
-| `ssh_list_files` | List remote directory via SFTP |
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `ssh_connect` | Connect to an SSH server using password or SSH key authentication. | - `host` (required): SSH server hostname or IP address (IPv4 or IPv6)<br>- `port` (optional): SSH server port (default: 22)<br>- `username` (required): Username for SSH authentication<br>- `password` (optional): Password for authentication<br>- `privateKey` (optional): Path to private SSH key file<br>- `passphrase` (optional): Passphrase for encrypted private key<br>- `connectionId` (optional): Unique identifier for this connection (default: "default") |
+| `ssh_execute` | Execute a command on an established SSH connection. | - `command` (required): Command to execute on the remote server<br>- `connectionId` (optional): Connection ID to use (default: "default")<br>- `timeout` (optional): Command timeout in milliseconds (default: 30000) |
+| `ssh_disconnect` | Disconnect from an SSH server. | - `connectionId` (optional): Connection ID to disconnect (default: "default") |
+| `ssh_list_connections` | List all active SSH connections. | *(None)* |
+| `ssh_upload_file` | Upload a file to the remote server via SFTP. | - `localPath` (required): Local file path to upload<br>- `remotePath` (required): Remote destination path<br>- `connectionId` (optional): Connection ID to use (default: "default")<br>- `createDirs` (optional): Create remote directories if they don't exist (default: true) |
+| `ssh_download_file` | Download a file from the remote server via SFTP. | - `remotePath` (required): Remote file path to download<br>- `localPath` (required): Local destination path<br>- `connectionId` (optional): Connection ID to use (default: "default")<br>- `createDirs` (optional): Create local directories if they don't exist (default: true) |
+| `ssh_list_files` | List files and directories on the remote server. | - `remotePath` (optional): Remote directory path to list (default: ".")<br>- `connectionId` (optional): Connection ID to use (default: "default")<br>- `detailed` (optional): Show detailed file information (default: false) |
 
-## Example Workflow
+## Examples
+
+### Basic Connection Examples
+
+**User prompt:** "Connect to my server at 192.168.1.100 with username admin and password mypass123"
+
+```
+ssh_connect with host="192.168.1.100", username="admin", password="mypass123"
+```
+
+**User prompt:** "SSH into my development server using my private key"
+
+```
+ssh_connect with host="dev.example.com", username="developer", privateKey="~/.ssh/id_rsa"
+```
+
+**User prompt:** "Connect to my IPv6 server with SSH key authentication"
+
+```
+ssh_connect with host="2001:db8::1", username="user", privateKey="/home/user/.ssh/dev_key", passphrase="keypassword"
+```
+
+### Command Execution Examples
+
+**User prompt:** "Check the disk space on my server"
+
+```
+ssh_execute with command="df -h"
+```
+
+**User prompt:** "Show me what processes are running"
+
+```
+ssh_execute with command="ps aux | head -20"
+```
+
+**User prompt:** "Run a system update on my Ubuntu server"
+
+```
+ssh_execute_script with script="""
+sudo apt update
+sudo apt upgrade -y
+sudo apt autoremove -y
+echo "System update completed"
+""", interpreter="bash"
+```
+
+### File Transfer Examples
+
+**User prompt:** "Copy the hello.zip file from my server's desktop to my desktop"
+
+```
+ssh_download_file with remotePath="/home/user/Desktop/hello.zip", localPath="~/Desktop/hello.zip"
+```
+
+**User prompt:** "Upload my config.json file to the server's /etc/myapp/ directory"
+
+```
+ssh_upload_file with localPath="./config.json", remotePath="/etc/myapp/config.json"
+```
+
+**User prompt:** "Send my backup script to the server and run it"
+
+```
+ssh_upload_and_execute with script="""
+#!/bin/bash
+mkdir -p /backup/$(date +%Y%m%d)
+tar -czf /backup/$(date +%Y%m%d)/data_backup.tar.gz /var/www/html
+echo "Backup completed successfully"
+""", filename="backup.sh", interpreter="bash"
+```
+
+**User prompt:** "Show me what's in the /var/log directory with file sizes"
+
+```
+ssh_list_files with remotePath="/var/log", detailed=true
+```
+
+### Multi-Server Management Examples
+
+**User prompt:** "Connect to both my production and staging servers"
+
+```
+ssh_connect with host="prod.example.com", username="admin", privateKey="~/.ssh/prod_key", connectionId="production"
+ssh_connect with host="staging.example.com", username="admin", privateKey="~/.ssh/staging_key", connectionId="staging"
+```
+
+**User prompt:** "Check uptime on both servers"
+
+```
+ssh_execute with command="uptime", connectionId="production"
+ssh_execute with command="uptime", connectionId="staging"
+```
+
+**User prompt:** "Deploy my app to staging server"
+
+```
+ssh_upload_file with localPath="./myapp.tar.gz", remotePath="/tmp/myapp.tar.gz", connectionId="staging"
+ssh_execute_script with script="""
+cd /var/www
+sudo tar -xzf /tmp/myapp.tar.gz
+sudo systemctl restart nginx
+sudo systemctl restart myapp
+echo "Deployment completed"
+""", connectionId="staging", interpreter="bash"
+```
+
+### Advanced Scripting Examples
+
+**User prompt:** "Run a Python script to analyze server performance"
+
+```
+ssh_execute_script with script="""
+import psutil
+import json
+
+# Get system info
+cpu_percent = psutil.cpu_percent(interval=1)
+memory = psutil.virtual_memory()
+disk = psutil.disk_usage('/')
+
+report = {
+    'cpu_usage': cpu_percent,
+    'memory_usage': memory.percent,
+    'disk_usage': (disk.used / disk.total) * 100,
+    'available_memory_gb': memory.available / (1024**3)
+}
+
+print(json.dumps(report, indent=2))
+""", interpreter="python3"
+```
+
+**User prompt:** "Monitor my application logs in real-time"
+
+```
+ssh_execute with command="tail -f /var/log/myapp/application.log", timeout=60000
+```
+
+**User prompt:** "Backup my database and download it"
+
+```
+ssh_execute_script with script="""
+timestamp=$(date +%Y%m%d_%H%M%S)
+mysqldump -u dbuser -p'dbpass' mydatabase > /tmp/backup_$timestamp.sql
+gzip /tmp/backup_$timestamp.sql
+echo "Backup created: /tmp/backup_$timestamp.sql.gz"
+""", interpreter="bash"
+
+# Then download the backup
+ssh_download_file with remotePath="/tmp/backup_20241203_143022.sql.gz", localPath="./database_backup.sql.gz"
+```
+
+### Example Workflow
 
 ```
 1. Load connections from CSV (passwords auto-resolved from env vars)
@@ -649,6 +894,77 @@ When a connection is created (via `ssh_connect` or `ssh_load_connections`), if t
 | Keepalive tracking | ✗ | ✓ |
 | `host`/`hostname` compatibility | ✗ | ✓ |
 
+## Security Considerations
+
+- This tool provides direct SSH access to remote servers
+- Always use strong authentication (prefer SSH keys over passwords)
+- Be cautious when executing commands with elevated privileges
+- Ensure proper network security and access controls
+- Private keys and passwords are handled securely in memory
+- Never commit credentials to version control
+- **Default is blacklist mode** — provides protection while remaining flexible
+- **Dangerous patterns are always checked** — even in disabled mode
+- **Audit logging enabled by default** — track blocked attempts
+- **Sudo can be restricted** — set `SSH_ALLOW_SUDO=false` for high-security environments
+- **Credential isolation** — passwords are resolved from env vars by connectionId, never typed in chat or visible in tool calls
+
+## Requirements
+
+- Node.js 18 or higher
+- Network access to target SSH servers
+- Valid SSH credentials for target servers
+
+## Troubleshooting
+
+### Common Issues
+
+1. **MCP server fails to start on Windows**
+
+   On Windows, `npx` and globally-installed npm commands are `.cmd` batch files. Claude Code uses `child_process.spawn()` to launch MCP servers, which cannot execute `.cmd` files directly. You must wrap the command with `cmd /c`:
+
+   ```bash
+   # Quick setup (Windows)
+   claude mcp add ssh-mcp-server-secured -- cmd /c npx @marian-craciunescu/ssh-mcp-server-secured@latest
+
+   # Or for global install (Windows)
+   claude mcp add ssh-mcp-server-secured -- cmd /c ssh-mcp-server
+   ```
+
+   If editing the config JSON manually, use:
+   ```json
+   {
+     "command": "cmd",
+     "args": ["/c", "npx", "@marian-craciunescu/ssh-mcp-server-secured@latest"]
+   }
+   ```
+
+   You can verify your setup by running `/doctor` in Claude CLI.
+
+2. **"Command not found" after global install**
+
+   ```bash
+   # Ensure npm global bin is in your PATH
+   npm config get prefix
+   export PATH="$(npm config get prefix)/bin:$PATH"
+   ```
+
+3. **MCP server not appearing in Claude**
+
+   - Verify configuration file path and JSON syntax
+   - Restart Claude CLI/Desktop after configuration changes
+   - Check Claude logs for connection errors
+
+4. **SSH connection failures**
+
+   - Verify network connectivity to target server
+   - Ensure SSH service is running on target server
+   - Check firewall settings and port accessibility
+   - Validate SSH credentials and key permissions
+
+5. **Permission errors**
+   - Ensure SSH keys have correct permissions (600)
+   - Verify user has necessary privileges on target server
+
 ## Development
 
 ```bash
@@ -666,13 +982,9 @@ npm run dev
 npx @modelcontextprotocol/inspector node index.js
 ```
 
-## Security Considerations
+## API Reference
 
-* **Default is blacklist mode** — provides protection while remaining flexible
-* **Dangerous patterns are always checked** — even in disabled mode
-* **Audit logging enabled by default** — track blocked attempts
-* **Sudo can be restricted** — set `SSH_ALLOW_SUDO=false` for high-security environments
-* **Credential isolation** — passwords are resolved from env vars by connectionId, never typed in chat or visible in tool calls
+For detailed API documentation of all available tools and their parameters, see the [Examples](#examples) section above.
 
 ## License
 

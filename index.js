@@ -359,12 +359,12 @@ class SSHMCPServer {
         const resolved = { ...args };
 
         const mapping = {
-            username:       `PROFILE_${name}_USER`,
-            password:       `PROFILE_${name}_PASSWORD`,
+            username: `PROFILE_${name}_USER`,
+            password: `PROFILE_${name}_PASSWORD`,
             enablePassword: `PROFILE_${name}_ENABLE_PASSWORD`,
-            deviceType:     `PROFILE_${name}_DEVICE_TYPE`,
-            jumpCommand:    `PROFILE_${name}_JUMP_COMMAND`,
-            preset:         `PROFILE_${name}_PRESET`,
+            deviceType: `PROFILE_${name}_DEVICE_TYPE`,
+            jumpCommand: `PROFILE_${name}_JUMP_COMMAND`,
+            preset: `PROFILE_${name}_PRESET`,
         };
 
         for (const [field, envKey] of Object.entries(mapping)) {
@@ -515,10 +515,10 @@ class SSHMCPServer {
     resolveJumpShellConfig(args) {
         const preset = args.preset ? JUMP_SHELL_PRESETS[args.preset.toLowerCase()] : null;
 
-        const jumpCommand       = args.jumpCommand       || (preset && preset.jumpCommand)       || null;
-        const jumpPromptPattern = args.jumpPromptPattern  || (preset && preset.jumpPromptPattern) || null;
-        const jumpExitCommand   = args.jumpExitCommand    || (preset && preset.jumpExitCommand)   || 'exit';
-        const jumpReadyTimeout  = args.jumpReadyTimeout   || (preset && preset.jumpReadyTimeout)  || 5000;
+        const jumpCommand = args.jumpCommand || (preset && preset.jumpCommand) || null;
+        const jumpPromptPattern = args.jumpPromptPattern || (preset && preset.jumpPromptPattern) || null;
+        const jumpExitCommand = args.jumpExitCommand || (preset && preset.jumpExitCommand) || 'exit';
+        const jumpReadyTimeout = args.jumpReadyTimeout || (preset && preset.jumpReadyTimeout) || 5000;
 
         if (!jumpCommand) {
             const hint = args.preset
@@ -1652,8 +1652,8 @@ class SSHMCPServer {
                         output += data.toString();
                     })
                     .stderr.on('data', (data) => {
-                    errorOutput += data.toString();
-                });
+                        errorOutput += data.toString();
+                    });
             });
         });
     }
@@ -1911,7 +1911,7 @@ class SSHMCPServer {
                 });
                 try {
                     if (connInfo.jumpShellActive) {
-                        this.exitJumpShell(connInfo, connectionId).catch(() => {});
+                        this.exitJumpShell(connInfo, connectionId).catch(() => { });
                     }
                     if (connInfo.keepaliveInterval) clearInterval(connInfo.keepaliveInterval);
                     if (connInfo.shell) connInfo.shell.end();
@@ -2396,8 +2396,43 @@ class SSHMCPServer {
     }
 }
 
-const server = new SSHMCPServer();
-server.run().catch((err) => {
-    logger.error('Server failed to start', { error: err.message });
-    process.exit(1);
-});
+// Handle --install flag: auto-configure Claude CLI with the correct platform-specific command
+if (process.argv.includes('--install')) {
+    import('child_process').then(({ execFileSync }) => {
+        const isWindows = process.platform === 'win32';
+        const pkg = '@marian-craciunescu/ssh-mcp-server-secured@latest';
+        const shellOpt = isWindows ? true : false;
+
+        // Remove existing config first (ignore errors if it doesn't exist)
+        try {
+            execFileSync('claude', ['mcp', 'remove', 'ssh-mcp-server-secured'], { stdio: 'pipe', shell: shellOpt });
+            console.log('Removed existing SSH MCP Server configuration.');
+        } catch {
+            // Not previously configured — that's fine
+        }
+
+        // Build the claude mcp add args with correct platform wrapping
+        const args = isWindows
+            ? ['mcp', 'add', 'ssh-mcp-server-secured', '--', 'cmd', '/c', 'npx', pkg]
+            : ['mcp', 'add', 'ssh-mcp-server-secured', '--', 'npx', pkg];
+
+        console.log(`Detected platform: ${process.platform}`);
+        console.log(`Running: claude ${args.join(' ')}`);
+
+        try {
+            execFileSync('claude', args, { stdio: 'inherit', shell: shellOpt });
+            console.log('\nSSH MCP Server Secured has been added to Claude CLI.');
+            console.log('Please restart Claude CLI to use the SSH tools.');
+        } catch (error) {
+            console.error(`\nFailed to add MCP server: ${error.message}`);
+            console.error('You can add it manually. See the README for instructions.');
+            process.exit(1);
+        }
+    });
+} else {
+    const server = new SSHMCPServer();
+    server.run().catch((err) => {
+        logger.error('Server failed to start', { error: err.message });
+        process.exit(1);
+    });
+}
