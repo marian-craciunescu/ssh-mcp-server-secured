@@ -671,8 +671,11 @@ class SSHMCPServer {
                         jumpPromptPattern: item.jumpPromptPattern || item.jump_prompt_pattern || null,
                         jumpExitCommand: item.jumpExitCommand || item.jump_exit_command || null,
                         jumpReadyTimeout: item.jumpReadyTimeout || item.jump_ready_timeout || null,
-                        sshAgent: !!(item.sshAgent || item.use_agent),
-                        sshAgentForward: !!(item.sshAgentForward || item.agent_forward),
+                        passphrase: item.passphrase || item.pass_phrase || item.key_password || null,
+                        privateKey: item.privateKey || item.private_key || item.key_path || null,
+                        sshAgent: !!(item.sshAgent || item.use_agent || item.agent),
+                        sshAgentSocket: item.sshAgentSocket || item.agent_socket || item.socket || null,
+                        sshAgentForward: !!(item.sshAgentForward || item.agent_forward || item.forward_agent),
                     });
                 }
                 logger.info(`Parsed JSON file: ${connections.length} connections`);
