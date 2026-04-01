@@ -361,6 +361,7 @@ class SSHMCPServer {
         const mapping = {
             username:       `PROFILE_${name}_USER`,
             password:       `PROFILE_${name}_PASSWORD`,
+            port:           `PROFILE_${name}_PORT`,
             enablePassword: `PROFILE_${name}_ENABLE_PASSWORD`,
             deviceType:     `PROFILE_${name}_DEVICE_TYPE`,
             jumpCommand:    `PROFILE_${name}_JUMP_COMMAND`,
@@ -372,7 +373,11 @@ class SSHMCPServer {
                 const envValue = process.env[envKey];
                 if (envValue) {
                     logger.info(`Profile ${args.profile}: resolved ${field} from ${envKey}`);
-                    resolved[field] = envValue;
+                    if (field === 'port') {
+                        resolved[field] = parseInt(envValue, 10);
+                    }else {
+                        resolved[field] = envValue;
+                    }
                 }
             }
         }

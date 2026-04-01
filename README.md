@@ -194,6 +194,7 @@ Profiles can include default SSH options for legacy devices, so you don't have t
 export PROFILE_CISCO_USER=admin
 export PROFILE_CISCO_PASSWORD=secret123
 export PROFILE_CISCO_DEVICE_TYPE=cisco
+export PROFILE_CISCO_PORT=2222
 export PROFILE_CISCO_SSH_OPTIONS='{"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"}'
 ````
 BELOW is an example of how profile env vars are resolved when loading connections from CSV/JSON. The `PROFILE_CISCO_SSH_OPTIONS` value is parsed as JSON and applied to all connections with `deviceType` of `cisco`.
@@ -206,6 +207,7 @@ BELOW is an example of how profile env vars are resolved when loading connection
 | PROFILE_CISCO_SSH_OPTIONS     | sshOptions (parsed as JSON) | {"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"}|
 | PROFILE_CISCO_JUMP_COMMAND    | jumpCommand                 | telnet lh |
 | PROFILE_CISCO_PRESET          | preset                      | topex |
+| PROFILE_CISCO_PORT            | port                        | 2222 |
 
 
 `ssh_connect host=10.0.0.1 profile=CISCO connectionId=SWITCH1"`
