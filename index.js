@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 
@@ -117,6 +117,16 @@ const DEFAULT_HOST_FILTER = {
     blacklist: [],
 };
 
+const DEFAULT_PAGER_REGEX = '-{2,}\\s*\\(?\\s*more\\b[^)\\r\\n]*\\)?\\s*-{2,}';
+const PAGER_SOURCE = process.env.SSH_PAGER_REGEX || DEFAULT_PAGER_REGEX;
+const PAGER_TAIL_PATTERN = new RegExp(PAGER_SOURCE + '\\s*$', 'i');
+const PAGER_STRIP_PATTERN = new RegExp(PAGER_SOURCE, 'gi');
+const PAGER_ADVANCE_KEY = process.env.SSH_PAGER_ADVANCE_KEY || ' ';
+
+function stripPagerArtifacts(text) {
+    return text.replace(PAGER_STRIP_PATTERN, '').replace(/\r/g, '');
+}
+
 // =============================================================================
 // JUMP SHELL PRESETS
 // =============================================================================
@@ -158,6 +168,15 @@ class SSHMCPServer {
         this.commandFilter = this.loadCommandFilter();
         this.hostFilter = this.loadHostFilter();
         this.failedConnectionsLog = process.env.SSH_FAILED_CONNECTIONS_LOG || resolve(__dirname, 'ssh-failed-connections.jsonl');
+
+        this.auditEnabled = process.env.SSH_AUDIT_ENABLED === undefined ? true : process.env.SSH_AUDIT_ENABLED === 'true';
+        this.auditDir = process.env.SSH_AUDIT_DIR || resolve(__dirname, 'audit');
+        if (this.auditEnabled && !existsSync(this.auditDir)) mkdirSync(this.auditDir, { recursive: true });
+
+        this.enableLargeOutput = process.env.SSH_ENABLE_LARGE_OUTPUT === 'true';
+        this.maxOutputLength = parseInt(process.env.SSH_MAX_OUTPUT_LENGTH || '10000', 10);
+        this.fileUploadEndpoint = process.env.SSH_FILE_UPLOAD_ENDPOINT || null;
+
         this.setupToolHandlers();
 
         // Idle timeout: disconnect after N seconds of no commands (0 = disabled)
@@ -396,6 +415,26 @@ class SSHMCPServer {
             }
         }
 
+        // Per-profile command filter from PROFILE_<NAME>_WHITELIST / _BLACKLIST
+        const parseList = (val) => {
+            if (!val) return null;
+            const arr = val.startsWith('[') ? JSON.parse(val) : val.split(',').map(s => s.trim()).filter(Boolean);
+            return arr.map(s => s.toLowerCase().trim());
+        };
+        let pWhitelist = null, pBlacklist = null;
+        try { pWhitelist = parseList(process.env[`PROFILE_${name}_WHITELIST`]); } catch (e) { logger.warn(`Profile ${args.profile}: bad WHITELIST`, { error: e.message }); }
+        try { pBlacklist = parseList(process.env[`PROFILE_${name}_BLACKLIST`]); } catch (e) { logger.warn(`Profile ${args.profile}: bad BLACKLIST`, { error: e.message }); }
+        if (pWhitelist || pBlacklist) {
+            resolved.profileFilter = { whitelist: pWhitelist, blacklist: pBlacklist };
+            logger.info(`Profile ${args.profile}: resolved command filter`, { whitelist: pWhitelist?.length || 0, blacklist: pBlacklist?.length || 0 });
+        }
+
+        // Per-profile pager toggle: PROFILE_<NAME>_DISABLE_PAGER overrides the global default
+        const pagerEnv = process.env[`PROFILE_${name}_DISABLE_PAGER`];
+        if (pagerEnv !== undefined) {
+            resolved.disablePager = pagerEnv !== 'false';
+        }
+
         return resolved;
     }
 
@@ -508,6 +547,25 @@ class SSHMCPServer {
         }
 
         return Object.keys(algorithms).length > 0 ? algorithms : null;
+    }
+
+    _disablePagerCommandFor(deviceType) {
+        const dt = (deviceType || '').toLowerCase();
+        const defaults = {
+            juniper: 'set cli screen-length 0',
+            cisco: 'terminal length 0',
+            mikrotik: '',
+            fortinet: 'config system console\nset output standard\nend',
+        };
+        const envOverride = process.env[`SSH_DISABLE_PAGER_CMD_${dt.toUpperCase()}`];
+        return envOverride !== undefined ? envOverride : (defaults[dt] || '');
+    }
+
+    _pagerDisabledFor(connectionInfo) {
+        if (connectionInfo && typeof connectionInfo.disablePager === 'boolean') {
+            return connectionInfo.disablePager;
+        }
+        return process.env.SSH_DISABLE_PAGER !== 'false';
     }
 
     // ===========================================================================
@@ -724,6 +782,37 @@ class SSHMCPServer {
             }
         }
 
+        // Mixed mode: whitelist + blacklist both active. Deny-by-default — a command
+        // must match a whitelist entry to be allowed. On conflict the longest
+        // matching entry (most specific) wins, regardless of which list it is in.
+        if (this.commandFilter.mode === 'mixed') {
+            const matchLen = (entries) => {
+                let best = -1;
+                for (const entry of entries || []) {
+                    if (lowerCmd === entry ||
+                        lowerCmd.startsWith(entry + ' ') ||
+                        lowerCmd.startsWith(entry + '\t') ||
+                        lowerCmd.startsWith(entry + '\n')) {
+                        if (entry.length > best) best = entry.length;
+                    }
+                }
+                return best;
+            };
+            const wl = matchLen(this.commandFilter.whitelistArray);
+            const bl = matchLen(this.commandFilter.blacklistArray);
+
+            if (wl < 0 && bl < 0) {
+                logger.warn('Command blocked: not in whitelist (mixed mode)', { command });
+                return { allowed: false, reason: 'Command not in whitelist' };
+            }
+            if (bl > wl) {
+                logger.warn('Command blocked: blacklist match wins (mixed mode)', { command, blacklistLen: bl, whitelistLen: wl });
+                return { allowed: false, reason: 'Blocked by blacklist (mixed mode)' };
+            }
+            logger.debug('Command allowed: whitelist match wins (mixed mode)', { command, whitelistLen: wl, blacklistLen: bl });
+            return { allowed: true, reason: 'Allowed by whitelist (mixed mode)' };
+        }
+
         // Check full command against blacklist first (for multi-word entries like 'configure terminal', 'conf t')
         if (this.commandFilter.mode === 'blacklist') {
             for (const blocked of this.commandFilter.blacklistArray) {
@@ -738,8 +827,20 @@ class SSHMCPServer {
             }
         }
 
-        // Check full command against whitelist (for multi-word entries)
-        // Note: no early return here — must still check individual commands in pipes/chains below
+        // Check full command against whitelist entries (for multi-word entries like
+        // 'terminal length 0', 'set cli screen-length 0'). A full-command match here
+        // allows the command outright, mirroring the blacklist's multi-word handling.
+        if (this.commandFilter.mode === 'whitelist') {
+            for (const allowed of this.commandFilter.whitelistArray) {
+                if (lowerCmd === allowed ||
+                    lowerCmd.startsWith(allowed + ' ') ||
+                    lowerCmd.startsWith(allowed + '\t') ||
+                    lowerCmd.startsWith(allowed + '\n')) {
+                    logger.debug('Command allowed: matches whitelist entry', { command, allowedEntry: allowed });
+                    return { allowed: true, reason: `'${allowed}' is whitelisted` };
+                }
+            }
+        }
 
         // Also check individual base commands in pipes/chains
         const allCommands = this.extractAllCommands(trimmedCmd);
@@ -766,6 +867,100 @@ class SSHMCPServer {
         }
     }
 
+    generateConnectionId(host) {
+        const now = new Date();
+        const y = now.getUTCFullYear();
+        const m = String(now.getUTCMonth() + 1).padStart(2, '0');
+        const d = String(now.getUTCDate()).padStart(2, '0');
+        const ipPart = String(host || 'unknown').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '');
+        const rand = randomBytes(4).toString('hex').slice(0, 6);
+        return `${ipPart}_${y}_${m}_${d}_sessionid_${rand}`;
+    }
+
+    validateCommandForConnection(command, connectionId) {
+        const base = this.validateCommand(command);
+        const connection = this.connections.get(connectionId);
+        const profileFilter = connection?.profileFilter;
+        if (!profileFilter) return base;
+
+        const lowerCmd = command.trim().toLowerCase();
+        const matchesEntry = (entry) =>
+            lowerCmd === entry || lowerCmd.startsWith(entry + ' ') || lowerCmd.startsWith(entry + '\t');
+
+        if (profileFilter.blacklist) {
+            for (const entry of profileFilter.blacklist) {
+                if (matchesEntry(entry)) {
+                    logger.warn('Command blocked: profile blacklist', { connectionId, command, entry });
+                    return { allowed: false, reason: `'${entry}' is blacklisted for this profile` };
+                }
+            }
+        }
+
+        if (profileFilter.whitelist) {
+            for (const entry of profileFilter.whitelist) {
+                if (matchesEntry(entry)) {
+                    logger.info('Command allowed: profile whitelist', { connectionId, command, entry });
+                    return { allowed: true, reason: `'${entry}' whitelisted for this profile` };
+                }
+            }
+            logger.warn('Command blocked: not in profile whitelist', { connectionId, command });
+            return { allowed: false, reason: `Command not in profile whitelist` };
+        }
+
+        return base;
+    }
+
+    recordAudit({ connectionId, host, command, output, exitCode = null, blocked = false }) {
+        if (!this.auditEnabled) return;
+        try {
+            const day = new Date().toISOString().slice(0, 10);
+            const line = JSON.stringify({
+                timestamp: new Date().toISOString(),
+                connectionId,
+                host: host || null,
+                command,
+                blocked,
+                exitCode,
+                output: output == null ? '' : String(output),
+            });
+            appendFileSync(resolve(this.auditDir, `audit_${day}.jsonl`), line + '\n');
+        } catch (e) {
+            logger.error('Failed to write audit record', { connectionId, error: e.message });
+        }
+    }
+
+    async uploadLargeOutput({ connectionId, command, header, output }) {
+        const full = `${header}${output}`;
+        if (!this.enableLargeOutput || full.length <= this.maxOutputLength) {
+            return { text: full };
+        }
+        if (!this.fileUploadEndpoint) {
+            logger.warn('Large output but SSH_FILE_UPLOAD_ENDPOINT not set; returning inline', { connectionId });
+            return { text: full };
+        }
+        try {
+            const res = await fetch(this.fileUploadEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: full, filename: `${connectionId}_${Date.now()}.txt` }),
+            });
+            if (!res.ok) throw new Error(`upload returned HTTP ${res.status}`);
+            const meta = await res.json();
+            const uri = meta.artifact_uri || meta.file_id;
+            logger.info('Large output uploaded', { connectionId, fileId: meta.file_id, size: full.length });
+            const stub =
+                `${header}[LARGE OUTPUT UPLOADED]\n` +
+                `Full output was ${full.length} bytes (limit ${this.maxOutputLength}).\n` +
+                `artifact_uri: ${meta.artifact_uri || ''}\n` +
+                `file_id: ${meta.file_id || ''}\n` +
+                `Retrieve the full content from the URI above.`;
+            return { text: stub, uploaded: true, uri };
+        } catch (e) {
+            logger.error('Large output upload failed, returning inline', { connectionId, error: e.message });
+            return { text: full };
+        }
+    }
+
     // ===========================================================================
     // TOOL HANDLERS SETUP
     // ===========================================================================
@@ -774,7 +969,7 @@ class SSHMCPServer {
             tools: [
                 {
                     name: 'ssh_connect',
-                    description: 'Connect to an SSH server. For Cisco/network devices, set deviceType to "cisco" for persistent shell mode.',
+                    description: 'Open an SSH connection. Returns a connectionId — reuse it for ssh_execute and ssh_disconnect. For Cisco/network gear set deviceType to "cisco".',
                     inputSchema: {
                         type: 'object',
                         properties: {
@@ -785,7 +980,7 @@ class SSHMCPServer {
                             password: { type: 'string', description: 'Password' },
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
-                            connectionId: { type: 'string', description: 'Unique connection ID', default: 'default' },
+                            connectionId: { type: 'string', description: 'Optional. Auto-generated and returned if omitted; reuse the returned value for later calls.' },
                             deviceType: { type: 'string', description: 'Device type: linux, cisco, mikrotik, juniper', default: 'linux' },
                             enablePassword: { type: 'string', description: 'Enable password for Cisco devices' },
                             sshOptions: {
@@ -795,7 +990,7 @@ class SSHMCPServer {
                                     + 'Prefix value with "+" to append to defaults. '
                                     + 'Example: { "KexAlgorithms": "+diffie-hellman-group-exchange-sha1", "HostKeyAlgorithms": "+ssh-rsa" }',
                             },
-                            profile: { type: 'string', description: 'Connection profile name. Resolves PROFILE_<NAME>_USER, _PASSWORD, _SSH_OPTIONS, _JUMP_COMMAND from env vars. Explicit values override profile.' },
+                            profile: { type: 'string', description: 'Named profile supplying preset credentials, options, and command allow/deny rules.' },
                         },
                         required: [],
                     },
@@ -817,7 +1012,7 @@ class SSHMCPServer {
                             password: { type: 'string', description: 'SSH password' },
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
-                            connectionId: { type: 'string', description: 'Unique connection ID', default: 'default' },
+                            connectionId: { type: 'string', description: 'Optional. Auto-generated and returned if omitted; reuse the returned value for later calls.' },
                             preset: { type: 'string', description: 'Built-in preset: freeswitch, topex. Auto-fills jump config where possible.' },
                             jumpCommand: { type: 'string', description: 'Command to enter nested shell (e.g. "telnet lh", "fs_cli").' },
                             jumpPromptPattern: { type: 'string', description: 'Regex matching the nested shell prompt (e.g. "topexsw>\\\\s*$").' },
@@ -828,7 +1023,7 @@ class SSHMCPServer {
                                 description: 'SSH -o style options for algorithm negotiation. '
                                     + 'Example: { "KexAlgorithms": "+diffie-hellman-group-exchange-sha1", "HostKeyAlgorithms": "+ssh-rsa" }',
                             },
-                            profile: { type: 'string', description: 'Connection profile name. Resolves PROFILE_<n>_USER, _PASSWORD, _SSH_OPTIONS, _JUMP_COMMAND from env vars.' },
+                            profile: { type: 'string', description: 'Named profile supplying preset credentials, options, and command allow/deny rules.' },
                         },
                         required: ['host'],
                     },
@@ -847,7 +1042,7 @@ class SSHMCPServer {
                 },
                 {
                     name: 'ssh_execute',
-                    description: 'Execute a command. For Cisco devices, uses persistent shell session.',
+                    description: 'Run a command on a connection. Large output is returned as a downloadable URI instead of inline.',
                     inputSchema: {
                         type: 'object',
                         properties: {
@@ -1008,7 +1203,6 @@ class SSHMCPServer {
             password,
             privateKey,
             passphrase,
-            connectionId = 'default',
             deviceType = 'linux',
             enablePassword,
             sshOptions,
@@ -1016,6 +1210,14 @@ class SSHMCPServer {
 
         const host = hostParam || hostname;
         if (!host) throw new Error('host is required');
+
+        let connectionId = resolved.connectionId;
+        if (!connectionId || connectionId === 'default') {
+            connectionId = this.generateConnectionId(host);
+            logger.info(`Generated connectionId`, { connectionId, host });
+        }
+
+        const profileFilter = resolved.profileFilter || null;
 
         const hostCheck = this.validateHost(host);
         if (!hostCheck.allowed) throw new Error(hostCheck.reason);
@@ -1089,6 +1291,8 @@ class SSHMCPServer {
                     connectionId,
                     deviceType: deviceType.toLowerCase(),
                     enablePassword,
+                    profileFilter,
+                    disablePager: resolved.disablePager,
                     jumpConfig: null,
                     jumpShellActive: false,
                     shell: null,
@@ -1126,7 +1330,7 @@ class SSHMCPServer {
                 resolve({
                     content: [{
                         type: 'text',
-                        text: `Connected to ${host}:${port} as ${username} (${connectionId}) [${deviceType}]${connectionInfo.shell ? ' - Shell mode active' : ''}`,
+                        text: `Connected to ${host}:${port} as ${username} [${deviceType}]${connectionInfo.shell ? ' - Shell mode active' : ''}\nconnectionId: ${connectionId}`,
                     }],
                 });
             });
@@ -1263,6 +1467,15 @@ class SSHMCPServer {
                 setTimeout(() => {
                     connectionInfo.shellReady = true;
                     logger.debug(`✓ Shell ready`, { connectionId, host: connectionInfo.host });
+                    const disablePagerCmd = this._disablePagerCommandFor(connectionInfo.deviceType);
+                    if (disablePagerCmd && this._pagerDisabledFor(connectionInfo)) {
+                        try {
+                            connectionInfo.shell.write(disablePagerCmd + '\n');
+                            logger.debug(`Sent disable-pager command`, { connectionId, cmd: disablePagerCmd });
+                        } catch (e) {
+                            logger.warn(`Failed to send disable-pager command`, { connectionId, error: e.message });
+                        }
+                    }
                     resolve();
                 }, 2000);
             });
@@ -1286,12 +1499,19 @@ class SSHMCPServer {
             password,
             privateKey,
             passphrase,
-            connectionId = 'default',
             sshOptions,
         } = resolved;
 
         const host = hostParam || hostname;
         if (!host) throw new Error('host is required');
+
+        let connectionId = resolved.connectionId;
+        if (!connectionId || connectionId === 'default') {
+            connectionId = this.generateConnectionId(host);
+            logger.info(`Generated connectionId`, { connectionId, host });
+        }
+
+        const profileFilter = resolved.profileFilter || null;
 
         const hostCheck = this.validateHost(host);
         if (!hostCheck.allowed) throw new Error(hostCheck.reason);
@@ -1357,6 +1577,8 @@ class SSHMCPServer {
                     connectionId,
                     deviceType: 'jump_shell',
                     enablePassword: null,
+                    profileFilter,
+                    disablePager: resolved.disablePager,
                     jumpConfig,
                     jumpShellActive: false,
                     shell: null,
@@ -1402,7 +1624,7 @@ class SSHMCPServer {
                 resolve({
                     content: [{
                         type: 'text',
-                        text: `Connected to ${host}:${port} as ${username} (${connectionId}) [jump_shell] → "${jumpConfig.jumpCommand}" ready`,
+                        text: `Connected to ${host}:${port} as ${username} [jump_shell] → "${jumpConfig.jumpCommand}" ready\nconnectionId: ${connectionId}`,
                     }],
                 });
             });
@@ -1517,8 +1739,9 @@ class SSHMCPServer {
     async handleSSHExecute(args) {
         const { command, connectionId = 'default', timeout = 30000 } = args;
 
-        const validation = this.validateCommand(command);
+        const validation = this.validateCommandForConnection(command, connectionId);
         if (!validation.allowed) {
+            this.recordAudit({ connectionId, host: this.connections.get(connectionId)?.host, command, output: validation.reason, blocked: true });
             throw new Error(`Command blocked: ${validation.reason}`);
         }
 
@@ -1554,11 +1777,17 @@ class SSHMCPServer {
 
         logger.info(`Executing command`, { connectionId, command, deviceType: connection.deviceType });
 
+        let result;
         if (connection.shell && connection.shellReady) {
-            return await this.executeViaShell(connection, command, timeout, connectionId);
+            result = await this.executeViaShell(connection, command, timeout, connectionId);
+        } else {
+            result = await this.executeViaExec(connection, command, timeout, connectionId);
         }
 
-        return await this.executeViaExec(connection, command, timeout, connectionId);
+        this.recordAudit({ connectionId, host: connection.host, command, output: result._rawOutput ?? '', exitCode: result._exitCode ?? null });
+
+        const handled = await this.uploadLargeOutput({ connectionId, command, header: result._header ?? '', output: result._rawOutput ?? '' });
+        return { content: [{ type: 'text', text: handled.text }] };
     }
 
     async executeViaShell(connection, command, timeout, connectionId) {
@@ -1576,32 +1805,68 @@ class SSHMCPServer {
             const checkInterval = 500;
             const stableThreshold = 3;
 
+            const pagerPattern = PAGER_TAIL_PATTERN;
+            let pageCount = 0;
+            const maxPages = parseInt(process.env.SSH_MAX_PAGER_PAGES || '1000', 10);
+
             const timeoutId = setTimeout(() => {
                 clearInterval(intervalId);
-                logger.warn(`Shell command timeout`, { connectionId, command });
+                logger.warn(`Shell command timeout`, { connectionId, command, pageCount });
+                const header = `[${connectionId}] Command: ${command}\n[TIMEOUT after ${timeout}ms]\nPartial output:\n`;
+                const out = stripPagerArtifacts(connection.shellBuffer);
                 resolve({
                     content: [{
                         type: 'text',
-                        text: `[${connectionId}] Command: ${command}\n[TIMEOUT after ${timeout}ms]\nPartial output:\n${connection.shellBuffer}`,
+                        text: `${header}${out}`,
                     }],
+                    _header: header,
+                    _rawOutput: out,
+                    _exitCode: null,
                 });
             }, timeout);
 
             const intervalId = setInterval(() => {
+                const tail = connection.shellBuffer.replace(/\r/g, '').trimEnd().slice(-80);
+                if (pagerPattern.test(tail)) {
+                    if (pageCount >= maxPages) {
+                        clearInterval(intervalId);
+                        clearTimeout(timeoutId);
+                        logger.warn(`Pager page limit reached`, { connectionId, command, maxPages });
+                        const header = `[${connectionId}] Command: ${command}\nOutput (truncated at ${maxPages} pages):\n`;
+                        const out = stripPagerArtifacts(connection.shellBuffer);
+                        return resolve({
+                            content: [{ type: 'text', text: `${header}${out}` }],
+                            _header: header,
+                            _rawOutput: out,
+                            _exitCode: null,
+                        });
+                    }
+                    pageCount++;
+                    logger.debug(`Pager prompt detected, advancing`, { connectionId, pageCount });
+                    shell.write(PAGER_ADVANCE_KEY);
+                    lastBufferLength = connection.shellBuffer.length;
+                    stableCount = 0;
+                    return;
+                }
+
                 if (connection.shellBuffer.length === lastBufferLength) {
                     stableCount++;
                     if (stableCount >= stableThreshold) {
                         clearInterval(intervalId);
                         clearTimeout(timeoutId);
 
-                        const output = connection.shellBuffer;
-                        logger.debug(`Shell command complete`, { connectionId, outputLength: output.length });
+                        const output = stripPagerArtifacts(connection.shellBuffer);
+                        logger.debug(`Shell command complete`, { connectionId, outputLength: output.length, pageCount });
 
+                        const header = `[${connectionId}] Command: ${command}\nOutput:\n`;
                         resolve({
                             content: [{
                                 type: 'text',
-                                text: `[${connectionId}] Command: ${command}\nOutput:\n${output}`,
+                                text: `${header}${output}`,
                             }],
+                            _header: header,
+                            _rawOutput: output,
+                            _exitCode: null,
                         });
                     }
                 } else {
@@ -1617,12 +1882,23 @@ class SSHMCPServer {
             let output = '';
             let errorOutput = '';
 
+            const disablePager = this._pagerDisabledFor(connection);
+            const pagerEnv = { SYSTEMD_PAGER: '', PAGER: 'cat', GIT_PAGER: 'cat' };
+            const envPrefix = disablePager
+                ? 'export SYSTEMD_PAGER= PAGER=cat GIT_PAGER=cat; '
+                : '';
+            const finalCommand = envPrefix + command;
+
+            const pagerPattern = new RegExp(PAGER_SOURCE, 'i');
+            let pageCount = 0;
+            const maxPages = parseInt(process.env.SSH_MAX_PAGER_PAGES || '1000', 10);
+
             const timeoutId = setTimeout(() => {
                 logger.warn(`Exec command timeout`, { connectionId, command });
                 reject(new Error(`Timeout after ${timeout}ms`));
             }, timeout);
 
-            connection.conn.exec(command, { pty: true }, (err, stream) => {
+            connection.conn.exec(finalCommand, { pty: true, env: pagerEnv }, (err, stream) => {
                 if (err) {
                     clearTimeout(timeoutId);
                     logger.error(`Exec error`, { connectionId, error: err.message });
@@ -1632,16 +1908,32 @@ class SSHMCPServer {
                 stream
                     .on('close', (code, signal) => {
                         clearTimeout(timeoutId);
-                        logger.debug(`Exec complete`, { connectionId, code, outputLength: output.length });
+                        logger.debug(`Exec complete`, { connectionId, code, outputLength: output.length, pageCount });
+                        const cleaned = stripPagerArtifacts(output);
+                        const header = `[${connectionId}] Command: ${command}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n`;
+                        const combined = `${cleaned}${errorOutput ? `\nStderr:\n${errorOutput}` : ''}`;
                         resolve({
                             content: [{
                                 type: 'text',
-                                text: `[${connectionId}] Command: ${command}\nExit Code: ${code}\n${signal ? `Signal: ${signal}\n` : ''}Output:\n${output}${errorOutput ? `\nStderr:\n${errorOutput}` : ''}`,
+                                text: `${header}${combined}`,
                             }],
+                            _header: header,
+                            _rawOutput: combined,
+                            _exitCode: code,
                         });
                     })
                     .on('data', (data) => {
                         output += data.toString();
+                        if (disablePager && pagerPattern.test(output.replace(/\r/g, '').trimEnd().slice(-120))) {
+                            if (pageCount < maxPages) {
+                                pageCount++;
+                                logger.debug(`Pager prompt detected on exec, advancing`, { connectionId, pageCount });
+                                try { stream.write(PAGER_ADVANCE_KEY); } catch (e) { /* stream may be closing */ }
+                            } else {
+                                logger.warn(`Pager page limit reached on exec, sending 'q'`, { connectionId, maxPages });
+                                try { stream.write('q'); } catch (e) { /* stream may be closing */ }
+                            }
+                        }
                     })
                     .stderr.on('data', (data) => {
                     errorOutput += data.toString();
@@ -1750,11 +2042,6 @@ class SSHMCPServer {
     // ===========================================================================
     async handleExecuteOnMultiple(args) {
         const { command, connectionIds = [], timeout = 30000 } = args;
-
-        const validation = this.validateCommand(command);
-        if (!validation.allowed) {
-            throw new Error(`Command blocked: ${validation.reason}`);
-        }
 
         let targetIds;
 
