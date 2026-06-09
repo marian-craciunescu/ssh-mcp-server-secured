@@ -106,7 +106,7 @@ Credentials live in the MCP config (or are injected via CI/CD, vault, etc.) and 
 
 When connecting to older devices that require non-default algorithms (the equivalent of `ssh -o`), use the `sshOptions` parameter:
 
-In natural language: 
+In natural language:
 >`Connect to 10.0.0.1 port 2222 as user, connectionId old-switch, with KexAlgorithms +diffie-hellman-group-exchange-sha1 and HostKeyAlgorithms +ssh-rsa`
 
 ```json
@@ -184,7 +184,7 @@ No passwords in the file. The server resolves `ROUTER1_PASSWORD`, `ROUTER2_PASSW
 ```
 
 **Profiles:**
-Define reusable connection profiles for connecting to the same type of device with similar settings (e.g. all Cisco switches). 
+Define reusable connection profiles for connecting to the same type of device with similar settings (e.g. all Cisco switches).
 Profiles can include default SSH options for legacy devices, so you don't have to repeat them in every connection.
 
 
@@ -208,9 +208,34 @@ BELOW is an example of how profile env vars are resolved when loading connection
 | PROFILE_CISCO_JUMP_COMMAND    | jumpCommand                 | telnet lh |
 | PROFILE_CISCO_PRESET          | preset                      | topex |
 | PROFILE_CISCO_PORT            | port                        | 2222 |
+| PROFILE_CISCO_WHITELIST       | per-profile command whitelist (comma-separated or JSON array) | show ospf neigh,show version |
+| PROFILE_CISCO_BLACKLIST       | per-profile command blacklist (comma-separated or JSON array) | show running config,conf t |
+| PROFILE_CISCO_DISABLE_PAGER   | per-profile pager toggle (`true`/`false`) | false |
 
 
 `ssh_connect host=10.0.0.1 profile=CISCO connectionId=SWITCH1"`
+
+#### Per-Profile Command Filtering
+
+In addition to the global `SSH_WHITELIST` / `SSH_BLACKLIST`, each profile can carry its own command filter via `PROFILE_<NAME>_WHITELIST` and `PROFILE_<NAME>_BLACKLIST`. These are layered on top of the global filter at execution time for any connection opened with that profile:
+
+* **Profile blacklist always blocks** — even commands the global filter would allow (e.g. block `show running config`).
+* **Profile whitelist re-allows** specific commands and, when present, becomes authoritative: anything not listed is blocked (e.g. allow `show ospf neigh` while the blacklist still blocks the rest).
+* On direct conflict, the **blacklist wins**.
+
+```bash
+export PROFILE_ROUTERS_BLACKLIST="show running config,conf t,configure terminal"
+export PROFILE_ROUTERS_WHITELIST="show ospf neigh,show version,show ip interface brief"
+```
+
+```
+ssh_connect host=10.0.0.1 profile=ROUTERS connectionId=router1
+# show ospf neigh        → allowed (profile whitelist)
+# show running config    → blocked (profile blacklist)
+```
+
+`PROFILE_<NAME>_DISABLE_PAGER=false` turns off pager suppression for connections using that profile, overriding the global `SSH_DISABLE_PAGER` default.
+
 
 **Usage:**
 
@@ -390,6 +415,16 @@ Log format:
 | `SSH_HOST_BLACKLIST` | comma-separated IPs | - | Blacklist of allowed host IPs |
 | `SSH_IDLE_TIMEOUT` | seconds | 120 | Idle connection timeout |
 |`SSH_FAILED_CONNECTIONS_LOG`|file  path |  ./ssh-failed-connections.json |/var/log/ssh-failed.jsonl |
+| `SSH_AUDIT_ENABLED` | `true`, `false` | `true` | Write a per-command session audit (command + full output) to JSONL |
+| `SSH_AUDIT_DIR` | path | `./audit` | Directory for daily `audit_YYYY-MM-DD.jsonl` files |
+| `SSH_ENABLE_LARGE_OUTPUT` | `true`, `false` | `false` | Offload oversized command output to an upload endpoint and return a URI instead of inline text |
+| `SSH_MAX_OUTPUT_LENGTH` | integer (chars) | `10000` | Output size threshold above which output is offloaded |
+| `SSH_FILE_UPLOAD_ENDPOINT` | URL | - | POST target for large output. Receives `{content, filename}`, must return `{file_id, artifact_uri}` |
+| `SSH_DISABLE_PAGER` | `true`, `false` | `true` | Suppress interactive pagers (`less`/`---(more)---`) on shell and exec |
+| `SSH_DISABLE_PAGER_CMD_<DEVICETYPE>` | string | per-device default | Override the disable-pager command for a device type (e.g. `SSH_DISABLE_PAGER_CMD_CISCO`) |
+| `SSH_PAGER_REGEX` | regex string | built-in | Override the pattern used to detect a pager prompt |
+| `SSH_PAGER_ADVANCE_KEY` | string | `" "` (space) | Key sent to advance to the next pager page |
+| `SSH_MAX_PAGER_PAGES` | integer | 1000 | Safety cap on auto-paged pages per command |
 
 
 Any additional environment variables following the `<CONNECTIONID>_PASSWORD` convention are automatically used for credential resolution (see [Credential Resolution Convention](#credential-resolution-convention)).
@@ -534,6 +569,48 @@ No command filtering (use with caution).
 4. Check full command against blacklist (multi-word support)
 5. Extract base commands from pipes/chains
 6. Check each base command against blacklist/whitelist
+7. Apply per-profile (per-connection) whitelist/blacklist on top of the global result
+
+## Stable Connection IDs
+
+If you don't pass a `connectionId` to `ssh_connect` (or pass `default`), the server generates a stable, structured id and **returns it in the connect response**:
+
+```
+<IP>_YYYY_MM_DD_sessionid_<6 random chars>
+```
+
+Example: `10_0_0_1_2026_06_08_sessionid_a1b9f3`
+
+The IP dots are replaced with `_` so the id is safe to use as an env-var prefix (for `<PREFIX>_PASSWORD` resolution) and as a filename. Capture the returned `connectionId` and reuse it for subsequent `ssh_execute` / `ssh_disconnect` calls.
+
+## Session Audit (command + output)
+
+Every executed command and its output is written as a single JSONL line to a per-day file, separate from server diagnostics (`SSH_LOG_FILE`):
+
+```
+<SSH_AUDIT_DIR>/audit_YYYY-MM-DD.jsonl
+```
+
+Each record:
+
+```json
+{"timestamp":"2026-06-08T11:07:12.569Z","connectionId":"10_0_0_1_2026_06_08_sessionid_a1b9f3","host":"10.0.0.1","command":"show version","exitCode":0,"output":"..."}
+```
+
+Disable with `SSH_AUDIT_ENABLED=false`.
+
+## Large Output Offloading
+
+When a command's output exceeds `SSH_MAX_OUTPUT_LENGTH` and `SSH_ENABLE_LARGE_OUTPUT=true`, the full output is POSTed to `SSH_FILE_UPLOAD_ENDPOINT` and the caller receives a short stub containing the returned `artifact_uri` and `file_id` plus a small preview — so a huge `show tech-support` never floods the model context. The endpoint receives `{ "content": "...", "filename": "..." }` and must return `{ "file_id": "...", "artifact_uri": "..." }`. If the endpoint is unset or the upload fails, output is returned inline as a fallback.
+
+## Pager Handling
+
+Interactive pagers (Linux `less`, Cisco/Juniper `---(more)---`) otherwise block a command until it times out. The server handles this two ways:
+
+* **Prevention** — on shell open it sends a device-appropriate disable-pager command (`terminal length 0` for Cisco, `set cli screen-length 0` for Juniper), and on Linux exec it sets `SYSTEMD_PAGER=`, `PAGER=cat`, `GIT_PAGER=cat`.
+* **Detection** — if a pager prompt still appears, it auto-advances (sends a space, capped by `SSH_MAX_PAGER_PAGES`) on network shells, or sends `q` to quit an interactive Linux pager, then strips the prompt artifacts from the output.
+
+Toggle globally with `SSH_DISABLE_PAGER=false`, per-profile with `PROFILE_<NAME>_DISABLE_PAGER=false`, override the command per device type with `SSH_DISABLE_PAGER_CMD_<DEVICETYPE>`, and override detection with `SSH_PAGER_REGEX` / `SSH_PAGER_ADVANCE_KEY`.
 
 ## Dangerous Patterns
 
@@ -563,6 +640,7 @@ These patterns are **always blocked** regardless of filter mode:
 | `ssh_disconnect_all` | Disconnect all connections |
 | `ssh_list_connections` | List active connections with status |
 | `ssh_check_connections` | Health check all connections (dead socket detection, shell status) |
+| `ssh_failed_connections` | List recent failed connection attempts (from the failed-connections JSONL log) |
 | `ssh_upload_file` | Upload file via SFTP |
 | `ssh_download_file` | Download file via SFTP |
 | `ssh_list_files` | List remote directory via SFTP |
