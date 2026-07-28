@@ -120,7 +120,7 @@ const DEFAULT_HOST_FILTER = {
 // Device types that use a persistent PTY shell instead of one-shot exec.
 // SHELL_DEVICE_TYPES: valid at connect time (before a jump shell is entered).
 // SHELL_OR_JUMP_TYPES: adds 'jump_shell', used post-connect (execute/health).
-const SHELL_DEVICE_TYPES = ['cisco', 'mikrotik', 'juniper', 'network', 'fortinet'];
+const SHELL_DEVICE_TYPES = ['cisco', 'cisco_xe', 'cisco_xr', 'cisco_asa', 'cisco_nexus', 'juniper', 'mikrotik', 'fortinet', 'paloalto', 'sophos', 'network'];
 const SHELL_OR_JUMP_TYPES = [...SHELL_DEVICE_TYPES, 'jump_shell'];
 
 function usesShell(deviceType, includeJump = true) {
@@ -562,11 +562,18 @@ class SSHMCPServer {
 
     _disablePagerCommandFor(deviceType) {
         const dt = (deviceType || '').toLowerCase();
+        const CISCO_PAGER = 'terminal length 0';
         const defaults = {
+            cisco: CISCO_PAGER,
+            cisco_xe: CISCO_PAGER,
+            cisco_xr: CISCO_PAGER,
+            cisco_asa: CISCO_PAGER,
+            cisco_nexus: CISCO_PAGER,
             juniper: 'set cli screen-length 0',
-            cisco: 'terminal length 0',
             mikrotik: '',
             fortinet: 'config system console\nset output standard\nend',
+            paloalto: 'set cli pager off',
+            sophos: '',
         };
         const envOverride = process.env[`SSH_DISABLE_PAGER_CMD_${dt.toUpperCase()}`];
         return envOverride !== undefined ? envOverride : (defaults[dt] || '');
@@ -992,7 +999,7 @@ class SSHMCPServer {
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
                             connectionId: { type: 'string', description: 'Optional. Auto-generated and returned if omitted; reuse the returned value for later calls.' },
-                            deviceType: { type: 'string', description: 'Device type: linux, cisco, mikrotik, juniper', default: 'linux' },
+                            deviceType: { type: 'string', description: 'Device type: linux, cisco, cisco_xe, cisco_xr, cisco_asa, cisco_nexus, juniper, mikrotik, fortinet, paloalto, sophos, network', default: 'linux' },
                             enablePassword: { type: 'string', description: 'Enable password for Cisco devices' },
                             sshOptions: {
                                 type: 'object',
@@ -1980,7 +1987,7 @@ class SSHMCPServer {
         }
 
         if (!connection.shell || !connection.shellReady) {
-            throw new Error(`No shell session for ${connectionId}. Device type must be 'cisco' or 'network'.`);
+            throw new Error(`No shell session for ${connectionId}. Enable mode requires a shell-based device type (cisco, cisco_asa, cisco_nexus, etc.).`);
         }
 
         let password = providedPassword || connection.enablePassword;
