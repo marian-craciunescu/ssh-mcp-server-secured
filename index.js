@@ -117,6 +117,17 @@ const DEFAULT_HOST_FILTER = {
     blacklist: [],
 };
 
+// Device types that use a persistent PTY shell instead of one-shot exec.
+// SHELL_DEVICE_TYPES: valid at connect time (before a jump shell is entered).
+// SHELL_OR_JUMP_TYPES: adds 'jump_shell', used post-connect (execute/health).
+const SHELL_DEVICE_TYPES = ['cisco', 'cisco_xe', 'cisco_xr', 'cisco_asa', 'cisco_nexus', 'juniper', 'mikrotik', 'fortinet', 'paloalto', 'sophos', 'network'];
+const SHELL_OR_JUMP_TYPES = [...SHELL_DEVICE_TYPES, 'jump_shell'];
+
+function usesShell(deviceType, includeJump = true) {
+    const dt = (deviceType || '').toLowerCase();
+    return (includeJump ? SHELL_OR_JUMP_TYPES : SHELL_DEVICE_TYPES).includes(dt);
+}
+
 const DEFAULT_PAGER_REGEX = '-{2,}\\s*\\(?\\s*more\\b[^)\\r\\n]*\\)?\\s*-{2,}';
 const PAGER_SOURCE = process.env.SSH_PAGER_REGEX || DEFAULT_PAGER_REGEX;
 const PAGER_TAIL_PATTERN = new RegExp(PAGER_SOURCE + '\\s*$', 'i');
@@ -551,11 +562,18 @@ class SSHMCPServer {
 
     _disablePagerCommandFor(deviceType) {
         const dt = (deviceType || '').toLowerCase();
+        const CISCO_PAGER = 'terminal length 0';
         const defaults = {
+            cisco: CISCO_PAGER,
+            cisco_xe: CISCO_PAGER,
+            cisco_xr: CISCO_PAGER,
+            cisco_asa: CISCO_PAGER,
+            cisco_nexus: CISCO_PAGER,
             juniper: 'set cli screen-length 0',
-            cisco: 'terminal length 0',
             mikrotik: '',
             fortinet: 'config system console\nset output standard\nend',
+            paloalto: 'set cli pager off',
+            sophos: '',
         };
         const envOverride = process.env[`SSH_DISABLE_PAGER_CMD_${dt.toUpperCase()}`];
         return envOverride !== undefined ? envOverride : (defaults[dt] || '');
@@ -981,7 +999,7 @@ class SSHMCPServer {
                             privateKey: { type: 'string', description: 'Path to private key file' },
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
                             connectionId: { type: 'string', description: 'Optional. Auto-generated and returned if omitted; reuse the returned value for later calls.' },
-                            deviceType: { type: 'string', description: 'Device type: linux, cisco, mikrotik, juniper', default: 'linux' },
+                            deviceType: { type: 'string', description: 'Device type: linux, cisco, cisco_xe, cisco_xr, cisco_asa, cisco_nexus, juniper, mikrotik, fortinet, paloalto, sophos, network', default: 'linux' },
                             enablePassword: { type: 'string', description: 'Enable password for Cisco devices' },
                             sshOptions: {
                                 type: 'object',
@@ -1313,7 +1331,7 @@ class SSHMCPServer {
                 }, 10000);
 
                 // For Cisco/network devices, open a persistent shell
-                if (['cisco', 'mikrotik', 'juniper', 'network'].includes(deviceType.toLowerCase())) {
+                if (usesShell(deviceType, false)) {
                     try {
                         await this.openShell(connectionInfo, connectionId);
                         logger.info(`✓ Shell opened for ${connectionId}`, { deviceType });
@@ -1470,8 +1488,19 @@ class SSHMCPServer {
                     const disablePagerCmd = this._disablePagerCommandFor(connectionInfo.deviceType);
                     if (disablePagerCmd && this._pagerDisabledFor(connectionInfo)) {
                         try {
-                            connectionInfo.shell.write(disablePagerCmd + '\n');
-                            logger.debug(`Sent disable-pager command`, { connectionId, cmd: disablePagerCmd });
+                            // Multi-line disable-pager commands (e.g. FortiOS
+                            // "config system console / set output standard / end")
+                            // must be sent one line at a time so the CLI processes
+                            // each as its own command. Single-line commands
+                            // (Cisco/Juniper) are just written directly.
+                            const lines = disablePagerCmd.split('\n').filter(l => l.length > 0);
+                            lines.forEach((line, i) => {
+                                setTimeout(() => {
+                                    try { connectionInfo.shell.write(line + '\n'); }
+                                    catch (e) { logger.warn(`Failed to send disable-pager line`, { connectionId, line, error: e.message }); }
+                                }, i * 200);
+                            });
+                            logger.debug(`Sent disable-pager command`, { connectionId, cmd: disablePagerCmd, lines: lines.length });
                         } catch (e) {
                             logger.warn(`Failed to send disable-pager command`, { connectionId, error: e.message });
                         }
@@ -1758,7 +1787,7 @@ class SSHMCPServer {
 
         connection.lastActivity = Date.now();
 
-        if (['cisco', 'mikrotik', 'juniper', 'network', 'jump_shell'].includes(connection.deviceType)) {
+        if (usesShell(connection.deviceType)) {
             if (!connection.shell || !connection.shellReady) {
                 logger.warn(`⚠ Shell not ready for ${connectionId}, attempting to reopen`, { host: connection.host });
                 try {
@@ -1883,8 +1912,12 @@ class SSHMCPServer {
             let errorOutput = '';
 
             const disablePager = this._pagerDisabledFor(connection);
-            const pagerEnv = { SYSTEMD_PAGER: '', PAGER: 'cat', GIT_PAGER: 'cat' };
-            const envPrefix = disablePager
+            // The 'export ...' prefix and PAGER env vars are POSIX-shell syntax —
+            // only valid on linux/unix. Network CLIs (fortinet, juniper, cisco, ...)
+            // reject 'export' as an unknown command/action, so never send it to them.
+            const isPosixShell = (connection.deviceType || 'linux') === 'linux';
+            const pagerEnv = (disablePager && isPosixShell) ? { SYSTEMD_PAGER: '', PAGER: 'cat', GIT_PAGER: 'cat' } : {};
+            const envPrefix = (disablePager && isPosixShell)
                 ? 'export SYSTEMD_PAGER= PAGER=cat GIT_PAGER=cat; '
                 : '';
             const finalCommand = envPrefix + command;
@@ -1954,7 +1987,7 @@ class SSHMCPServer {
         }
 
         if (!connection.shell || !connection.shellReady) {
-            throw new Error(`No shell session for ${connectionId}. Device type must be 'cisco' or 'network'.`);
+            throw new Error(`No shell session for ${connectionId}. Enable mode requires a shell-based device type (cisco, cisco_asa, cisco_nexus, etc.).`);
         }
 
         let password = providedPassword || connection.enablePassword;
@@ -2314,7 +2347,7 @@ class SSHMCPServer {
                 deadConnections.push(connectionId);
             } else {
                 status.status = 'ALIVE';
-                if (['cisco', 'mikrotik', 'juniper', 'network', 'jump_shell'].includes(connection.deviceType)) {
+                if (usesShell(connection.deviceType)) {
                     if (connection.shell && connection.shellReady) {
                         status.shellStatus = 'ACTIVE';
                         if (connection.jumpShellActive) {
