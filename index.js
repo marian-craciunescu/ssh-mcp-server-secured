@@ -608,7 +608,7 @@ class SSHMCPServer {
             throw new Error(`jumpCommand is required. ${hint}`);
         }
         if (!jumpPromptPattern) {
-            throw new Error('jumpPromptPattern is required. Provide a regex matching the nested shell prompt (e.g. "topexsw>\\\\s*$").');
+            throw new Error('jumpPromptPattern is required. Provide a regex matching the nested shell prompt, e.g. `topexsw>\\s*$`');
         }
 
         return { jumpCommand, jumpPromptPattern, jumpExitCommand, jumpReadyTimeout };
@@ -987,7 +987,7 @@ class SSHMCPServer {
             tools: [
                 {
                     name: 'ssh_connect',
-                    description: 'Open an SSH connection. Returns a connectionId - reuse it for ssh_execute and ssh_disconnect. For Cisco/network gear set deviceType to "cisco".',
+                    description: 'Open an SSH connection. Returns a connectionId - reuse it for ssh_execute and ssh_disconnect. For Cisco or network gear set deviceType to cisco.',
                     inputSchema: {
                         type: 'object',
                         properties: {
@@ -1032,9 +1032,9 @@ class SSHMCPServer {
                             passphrase: { type: 'string', description: 'Passphrase for private key' },
                             connectionId: { type: 'string', description: 'Optional. Auto-generated and returned if omitted; reuse the returned value for later calls.' },
                             preset: { type: 'string', description: 'Built-in preset: freeswitch, topex. Auto-fills jump config where possible.' },
-                            jumpCommand: { type: 'string', description: 'Command to enter nested shell (e.g. "telnet lh", "fs_cli").' },
-                            jumpPromptPattern: { type: 'string', description: 'Regex matching the nested shell prompt (e.g. "topexsw>\\\\s*$").' },
-                            jumpExitCommand: { type: 'string', description: 'Command to exit the nested shell. Default from preset or "exit".' },
+                            jumpCommand: { type: 'string', description: 'Command to enter nested shell, e.g. telnet lh or fs_cli.' },
+                            jumpPromptPattern: { type: 'string', description: 'Regex matching the nested shell prompt. Example: `topexsw>\\s*$`' },
+                            jumpExitCommand: { type: 'string', description: 'Command to exit the nested shell. Defaults from preset, otherwise exit.' },
                             jumpReadyTimeout: { type: 'number', description: 'Timeout in ms waiting for nested prompt.', default: 5000 },
                             sshOptions: {
                                 type: 'object',
@@ -1081,7 +1081,7 @@ class SSHMCPServer {
                             connectionIds: {
                                 type: 'array',
                                 items: { type: 'string' },
-                                description: 'List of connection IDs to execute on. Use "*" or empty array for all connections.'
+                                description: 'List of connection IDs to execute on. Use a single asterisk or an empty array for all connections.'
                             },
                             timeout: { type: 'number', description: 'Timeout in ms', default: 30000 },
                         },
