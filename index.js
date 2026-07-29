@@ -964,14 +964,13 @@ class SSHMCPServer {
             });
             if (!res.ok) throw new Error(`upload returned HTTP ${res.status}`);
             const meta = await res.json();
-            const uri = meta.artifact_uri || meta.file_id;
+            const uri = meta.artifact_uri || meta.file_id || '';
             logger.info('Large output uploaded', { connectionId, fileId: meta.file_id, size: full.length });
-            const stub =
-                `${header}[LARGE OUTPUT UPLOADED]\n` +
-                `Full output was ${full.length} bytes (limit ${this.maxOutputLength}).\n` +
-                `artifact_uri: ${meta.artifact_uri || ''}\n` +
-                `file_id: ${meta.file_id || ''}\n` +
-                `Retrieve the full content from the URI above.`;
+            const nextAction =
+                'A document has been generated and stored for the user. Do NOT paraphrase or ' +
+                'summarize its full contents. Include the artifact_uri value verbatim, exactly ' +
+                'as provided, in your reply so the user can open the document.';
+            const stub = JSON.stringify({ artifact_uri: uri, next_action: nextAction });
             return { text: stub, uploaded: true, uri };
         } catch (e) {
             logger.error('Large output upload failed, returning inline', { connectionId, error: e.message });
