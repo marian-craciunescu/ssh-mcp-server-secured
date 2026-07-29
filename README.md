@@ -253,8 +253,15 @@ The server supports different device types with appropriate connection handling:
 |-------------|----------|----------|
 | `linux` | Standard SSH exec mode (default) | Linux/Unix servers |
 | `cisco` | Persistent shell, enable mode support | Cisco IOS/IOS-XE routers and switches |
-| `juniper` | Persistent shell | Juniper JunOS devices |
+| `cisco_xe` | Persistent shell (`terminal length 0`) | Cisco IOS-XE |
+| `cisco_xr` | Persistent shell (`terminal length 0`) | Cisco IOS-XR |
+| `cisco_asa` | Persistent shell (`terminal length 0`) | Cisco ASA firewalls |
+| `cisco_nexus` | Persistent shell (`terminal length 0`) | Cisco Nexus (NX-OS) |
+| `juniper` | Persistent shell (`set cli screen-length 0`) | Juniper JunOS devices |
 | `mikrotik` | Persistent shell | MikroTik RouterOS |
+| `fortinet` | Persistent shell (`config system console` / `set output standard`) | FortiGate / FortiOS firewalls |
+| `paloalto` | Persistent shell (`set cli pager off`) | Palo Alto PAN-OS firewalls |
+| `sophos` | Persistent shell (pager auto-handled at runtime) | Sophos XG/XGS (SFOS) firewalls |
 | `network` | Generic persistent shell | Other network devices |
 | `jump_shell` | Persistent shell + nested CLI | Used internally by `ssh_connect_with_jump_command` |
 
@@ -636,6 +643,7 @@ These patterns are **always blocked** regardless of filter mode:
 | `ssh_execute` | Execute a command on one connection |
 | `ssh_cisco_enable` | Enter Cisco privileged EXEC mode (interactive enable password handling) |
 | `ssh_execute_on_multiple` | Execute a command on selected connections (`["*"]` = all) |
+| `ssh_get_command_filter` | Show the command filter (whitelist/blacklist, global + per-profile, with precedence rules) and the host filter (allowed/blocked hosts) that apply to a connection; optionally check whether a specific command would be allowed |
 | `ssh_disconnect` | Disconnect one connection |
 | `ssh_disconnect_all` | Disconnect all connections |
 | `ssh_list_connections` | List active connections with status |
