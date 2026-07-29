@@ -987,7 +987,7 @@ class SSHMCPServer {
             tools: [
                 {
                     name: 'ssh_connect',
-                    description: 'Open an SSH connection. Returns a connectionId — reuse it for ssh_execute and ssh_disconnect. For Cisco/network gear set deviceType to "cisco".',
+                    description: 'Open an SSH connection. Returns a connectionId - reuse it for ssh_execute and ssh_disconnect. For Cisco/network gear set deviceType to "cisco".',
                     inputSchema: {
                         type: 'object',
                         properties: {
@@ -1107,6 +1107,17 @@ class SSHMCPServer {
                     },
                 },
                 {
+                    name: 'ssh_get_command_filter',
+                    description: 'Show the command filter (whitelist/blacklist) and host filter (allowed/blocked hosts) that apply to a connection: the global filter plus any per-profile rules layered on top. Use to understand why a command would be allowed or blocked, or why a host connection was refused.',
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            connectionId: { type: 'string', description: 'Connection to inspect. If omitted, shows only the global filter.' },
+                            command: { type: 'string', description: 'Optional. If provided, also returns whether this specific command would be allowed and why.' },
+                        },
+                    },
+                },
+                {
                     name: 'ssh_list_connections',
                     description: 'List all active SSH connections',
                     inputSchema: {
@@ -1189,6 +1200,7 @@ class SSHMCPServer {
                     case 'ssh_execute_on_multiple': return await this.handleExecuteOnMultiple(args);
                     case 'ssh_disconnect': return await this.handleSSHDisconnect(args);
                     case 'ssh_disconnect_all': return await this.handleDisconnectAll();
+                    case 'ssh_get_command_filter': return await this.handleGetCommandFilter(args);
                     case 'ssh_list_connections': return await this.handleListConnections();
                     case 'ssh_check_connections': return await this.handleCheckConnections();
                     case 'ssh_upload_file': return await this.handleSSHUploadFile(args);
@@ -1348,7 +1360,7 @@ class SSHMCPServer {
                 resolve({
                     content: [{
                         type: 'text',
-                        text: `Connected to ${host}:${port} as ${username} [${deviceType}]${connectionInfo.shell ? ' - Shell mode active' : ''}\nconnectionId: ${connectionId}`,
+                        text: `connectionId=${connectionId} | connected to ${host}:${port} as ${username} (${deviceType}); use this connectionId for ssh_execute`,
                     }],
                 });
             });
@@ -1653,7 +1665,7 @@ class SSHMCPServer {
                 resolve({
                     content: [{
                         type: 'text',
-                        text: `Connected to ${host}:${port} as ${username} [jump_shell] → "${jumpConfig.jumpCommand}" ready\nconnectionId: ${connectionId}`,
+                        text: `connectionId=${connectionId} | connected to ${host}:${port} as ${username} (jump_shell); use this connectionId for ssh_execute`,
                     }],
                 });
             });
@@ -2291,6 +2303,65 @@ class SSHMCPServer {
         return {
             content: [{ type: 'text', text: `Disconnected ${connectionIds.length} connections` }],
         };
+    }
+
+    async handleGetCommandFilter(args) {
+        const { connectionId, command } = args || {};
+
+        const precedence = [
+            "Resolution order for whether a command is allowed (first decisive rule wins):",
+            "1. If global mode is 'disabled' -> allowed (no filtering).",
+            "2. sudo: if allowSudo is false and the command starts with 'sudo', it is blocked.",
+            "3. Dangerous patterns (fork bombs, curl|bash, etc.) -> always blocked. Cannot be overridden by any whitelist.",
+            "4. Global filter verdict by mode: blacklist = allow unless listed; whitelist = allow only if listed; mixed = deny-by-default, and on a whitelist/blacklist conflict the LONGEST matching entry wins.",
+            "5. Per-profile filter is then layered ON TOP of the global verdict (only if the connection has one): (a) profile blacklist match -> blocked, even if global allowed it; (b) else if a profile whitelist exists, it is AUTHORITATIVE -> command must match it or it is blocked; (c) else fall back to the global verdict.",
+            "Note: the per-profile layer uses blacklist-first (profile blacklist beats profile whitelist on conflict), whereas global 'mixed' mode uses longest-match. These are intentionally different.",
+        ];
+
+        const global = {
+            mode: this.commandFilter.mode,
+            allowSudo: this.commandFilter.allowSudo,
+            whitelist: this.commandFilter.whitelistArray || [],
+            blacklist: this.commandFilter.blacklistArray || [],
+        };
+
+        const hostFilter = {
+            mode: this.hostFilter.mode,
+            whitelist: [...this.hostFilter.whitelist],
+            blacklist: [...this.hostFilter.blacklist],
+            note: "Applied at connect time (ssh_connect), not per command. Matching is EXACT host/IP string match (case-insensitive) - no CIDR or wildcard. mode: disabled = any host; whitelist = only listed hosts may connect; blacklist = listed hosts are refused.",
+        };
+
+        const result = { precedence, global, hostFilter };
+
+        if (connectionId) {
+            const connection = this.connections.get(connectionId);
+            if (!connection) {
+                throw new Error(`No connection: ${connectionId}`);
+            }
+            result.connectionId = connectionId;
+            result.deviceType = connection.deviceType;
+            const pf = connection.profileFilter;
+            if (pf) {
+                result.profileFilter = {
+                    whitelist: pf.whitelist || [],
+                    blacklist: pf.blacklist || [],
+                    note: 'Layered on top of the global filter at execute time. Profile blacklist always blocks; if a profile whitelist is set it is authoritative (commands not listed are blocked).',
+                };
+            } else {
+                result.profileFilter = null;
+            }
+
+            if (command) {
+                const decision = this.validateCommandForConnection(command, connectionId);
+                result.commandCheck = { command, allowed: decision.allowed, reason: decision.reason };
+            }
+        } else if (command) {
+            const decision = this.validateCommand(command);
+            result.commandCheck = { command, allowed: decision.allowed, reason: decision.reason };
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
 
     async handleListConnections() {
