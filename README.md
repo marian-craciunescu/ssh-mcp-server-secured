@@ -8,10 +8,11 @@ A **secured** fork of [zibdie/SSH-MCP-Server](https://github.com/zibdie/SSH-MCP-
 
 ## Key Features
 
+* **One-Shot Execution**: `ssh_run` connects, runs a command, and disconnects in a single tool call — no connectionId to pass around
 * **Command Whitelist/Blacklist**: Control which commands can be executed
 * **Dangerous Pattern Detection**: Blocks fork bombs, command injection, and destructive patterns
-* **Network Device Support**: Cisco, Juniper, MikroTik with persistent shell sessions and enable mode
-* **Jump Shell Support**: SSH into a host then enter a nested CLI (telnet to a host, FreeSWITCH fs_cli, etc.) — commands execute inside the nested shell
+* **Network Device Support**: Cisco, Juniper, MikroTik, FortiGate, Palo Alto, Sophos with persistent shell sessions and automatic pager suppression
+* **Jump Shell Support**: SSH into a host then enter a nested CLI (telnet to a host, FreeSWITCH fs_cli, etc.) — commands execute inside the nested shell, with an ordered fallback list of jump commands
 * **Bulk Connection Management**: Load dozens of connections from CSV/JSON files
 * **Environment Variable Credentials**: Passwords auto-resolved from env vars by connectionId — no secrets in chat
 * **Multi-Connection Execution**: Run commands across all or selected connections simultaneously
@@ -267,17 +268,57 @@ The server supports different device types with appropriate connection handling:
 
 Network devices use PTY-allocated persistent shell sessions instead of standard `exec()` because many network operating systems close the SSH channel after each exec command.
 
-### 4. Cisco Enable Mode
+### 4. One-Shot Command (`ssh_run`)
 
-Enter privileged EXEC mode on Cisco devices using `ssh_cisco_enable`:
+`ssh_connect` + `ssh_execute` + `ssh_disconnect` is three tool calls, and the middle two require the model to copy a generated connectionId verbatim. `ssh_run` collapses that into one call:
 
 ```json
 {
-  "connectionId": "router1"
+  "host": "10.1.2.15",
+  "profile": "ROUTERS",
+  "command": "show version"
 }
 ```
 
-The tool handles the interactive enable password prompt automatically — it sends `enable`, waits for `Password:`, sends the stored `enablePassword`, and verifies the prompt changed to `#`.
+Connects, runs the command, and closes the connection. Returns the command output — no connectionId to track.
+
+**On failure the connection is kept open** so you can retry a different command. The result is a structured object (returned both as JSON text and in `structuredContent`):
+
+```json
+{
+  "status": "error",
+  "connectionId": "10_1_2_15_2026_08_12_sessionid_a1b2c3",
+  "command": "show bogus",
+  "error": "Command exited with code 2",
+  "exitCode": 2,
+  "output": "% Invalid input detected",
+  "retry": "The SSH connection is still open. Call ssh_execute with this connectionId to run a different command, then ssh_disconnect when finished."
+}
+```
+
+Retry with `ssh_execute` using that `connectionId`, then `ssh_disconnect`. Abandoned connections are reaped by `SSH_IDLE_TIMEOUT` (default 120s).
+
+Profiles, whitelist/blacklist, host filter, audit logging, pager handling, and large-output offload all behave exactly as with `ssh_connect` + `ssh_execute`. A command blocked by the filter is rejected **before** any SSH session is opened.
+
+Success is defined as: the command executed and its exit code is `0` or absent. Network devices on the persistent-shell path do not report exit codes, so those commands are successful unless execution itself fails. On Linux a non-zero exit code counts as a failure and keeps the connection open.
+
+#### Nested CLI with fallbacks (`ssh_run_with_jump`)
+
+Same one-call flow, but enters a nested CLI first. `jumpCommands` is a list tried in order until one reaches the nested prompt:
+
+```json
+{
+  "host": "10.0.0.1",
+  "username": "admin",
+  "preset": "topex",
+  "jumpCommands": ["telnet lh", "telnet 127.0.0.1"],
+  "command": "view portsoncard *"
+}
+```
+
+If `telnet lh` fails to reach the prompt, `telnet 127.0.0.1` is tried. Each attempt is a fresh connection, so a half-open telnet from a failed attempt cannot corrupt the next one. If every candidate fails, the error lists what each one returned.
+
+All candidates share one `jumpPromptPattern` (supplied directly or via `preset`). When candidates need *different* prompt patterns, use `ssh_connect_with_jump_command` instead. `PROFILE_<NAME>_JUMP_COMMAND` supplies a single candidate when `jumpCommands` is omitted.
 
 ### 5. Execute on Multiple Connections
 
@@ -564,6 +605,48 @@ Only commands in the whitelist are allowed. Everything else is blocked.
 ✗ make install            → Blocked: 'make' not in whitelist
 ```
 
+### Mixed Mode
+
+Both lists are active at once and the filter is **deny-by-default**: a command must match a whitelist entry to run. On a conflict, **the longest matching entry wins**, whichever list it came from. This is what lets you allow a broad prefix, carve a dangerous subset out of it, and then allow a narrower exception back in.
+
+Matching is by prefix: an entry matches when the command equals it, or starts with it followed by a space, tab, or newline. Comparison is lowercased and trimmed.
+
+```
+SSH_FILTER_MODE=mixed
+SSH_WHITELIST=show, show running-config interface, show running-config | include, ping -c , ls -lha, terminal length 0
+SSH_BLACKLIST=show running-config, conf t, configure terminal, reload, rm, shutdown, ping
+```
+
+Resulting decisions:
+
+```
+✓ show version                            → 'show' (4) beats nothing
+✓ show interfaces terse                   → 'show' (4) beats nothing
+✗ show running-config                     → 'show running-config' (19) beats 'show' (4)
+✓ show running-config interface Gi0/1     → 'show running-config interface' (29) beats 'show running-config' (19)
+✓ show running-config | include hostname  → 'show running-config | include' (29) beats 'show running-config' (19)
+✓ ping -c 4 8.8.8.8                       → 'ping -c' (7) beats 'ping' (4)
+✗ ping 8.8.8.8                            → only 'ping' (4) matches, and it is blacklisted
+✓ terminal length 0                       → whitelisted, so the server can disable its own pager
+✓ ls -lha                                 → exact whitelist entry
+✗ ls -la                                  → matches NEITHER list → blocked by deny-by-default
+✗ reload                                  → blacklisted, no whitelist match
+✗ rm -rf /tmp/x                           → 'rm' (2) blacklisted, no whitelist match
+```
+
+Two things to know:
+
+* **`ls -lha` is allowed but `ls -la` is not.** Whitelist entries are literal prefixes, not patterns. In mixed mode anything you have not explicitly allowed is blocked, so list the exact command forms you intend to run.
+* **Exact ties go to the whitelist.** If the same string is in both lists, the command is allowed.
+
+Include your pager-disable commands (`terminal length 0`, `set cli screen-length 0`) in the whitelist. The server issues them itself when opening a shell, and mixed mode would otherwise block them.
+
+Unlike blacklist and whitelist mode, mixed mode does **not** inspect the individual segments of a pipe or chain — it only matches the full command string. Segment-level protection in mixed mode comes from the dangerous-pattern list, which runs first and cannot be overridden:
+
+```
+✗ show version | rm -rf /   → Blocked: dangerous pattern /\|\s*rm/i
+```
+
 ### Disabled Mode
 
 No command filtering (use with caution).
@@ -572,11 +655,14 @@ No command filtering (use with caution).
 
 1. Check if filtering disabled
 2. Check sudo permission
-3. Check dangerous patterns (regex)
-4. Check full command against blacklist (multi-word support)
-5. Extract base commands from pipes/chains
-6. Check each base command against blacklist/whitelist
-7. Apply per-profile (per-connection) whitelist/blacklist on top of the global result
+3. Check dangerous patterns (regex) — always wins, no whitelist can override
+4. In `mixed` mode: longest-match between whitelist and blacklist over the full command; deny-by-default if neither matches. Stops here.
+5. Check full command against blacklist (multi-word support)
+6. Extract base commands from pipes/chains
+7. Check each base command against blacklist/whitelist
+8. Apply per-profile (per-connection) whitelist/blacklist on top of the global result
+
+Use `ssh_get_command_filter` to see the active rules and to ask why a specific command would be allowed or blocked.
 
 ## Stable Connection IDs
 
@@ -635,66 +721,116 @@ These patterns are **always blocked** regardless of filter mode:
 
 ## Available Tools
 
+### One-shot (recommended)
+
 | Tool | Description |
 |------|-------------|
-| `ssh_connect` | Connect to a single host (password auto-resolved from `<CONNECTIONID>_PASSWORD` env var) , supports `sshOptions` for legacy algorithm negotiation) |
-| `ssh_connect_with_jump_command` | SSH into a host, then enter a nested CLI (telnet, fs_cli, etc.) via a jump command. Supports presets. |
-| `ssh_load_connections` | Load connections from CSV/JSON file (credentials resolved from env vars per connectionId) |
-| `ssh_execute` | Execute a command on one connection |
-| `ssh_cisco_enable` | Enter Cisco privileged EXEC mode (interactive enable password handling) |
-| `ssh_execute_on_multiple` | Execute a command on selected connections (`["*"]` = all) |
-| `ssh_get_command_filter` | Show the command filter (whitelist/blacklist, global + per-profile, with precedence rules) and the host filter (allowed/blocked hosts) that apply to a connection; optionally check whether a specific command would be allowed |
-| `ssh_disconnect` | Disconnect one connection |
-| `ssh_disconnect_all` | Disconnect all connections |
-| `ssh_list_connections` | List active connections with status |
-| `ssh_check_connections` | Health check all connections (dead socket detection, shell status) |
-| `ssh_failed_connections` | List recent failed connection attempts (from the failed-connections JSONL log) |
-| `ssh_upload_file` | Upload file via SFTP |
-| `ssh_download_file` | Download file via SFTP |
-| `ssh_list_files` | List remote directory via SFTP |
+| `ssh_run` | Connect, run one command, and close the connection on success — one call, no connectionId to track. On failure the connection is left open and its `connectionId` is returned so you can retry a different command with `ssh_execute`. Required: `host`, `command`. |
+| `ssh_run_with_jump` | Same as `ssh_run`, but enters a nested CLI first. Takes `jumpCommands` as a list and tries them in order until one reaches the nested prompt. Required: `host`, `command`. |
+
+### Connection management
+
+| Tool | Description |
+|------|-------------|
+| `ssh_connect` | Open a persistent connection and return a `connectionId`. Password auto-resolved from `<CONNECTIONID>_PASSWORD` env var; supports `sshOptions` for legacy algorithm negotiation. |
+| `ssh_connect_with_jump_command` | SSH into a host, then enter a nested CLI (telnet, fs_cli, etc.) via a single jump command. Supports presets. Use this when each candidate needs its own prompt pattern. |
+| `ssh_load_connections` | Load connections from a CSV/JSON file (credentials resolved from env vars per connectionId). |
+| `ssh_disconnect` | Disconnect one connection. |
+| `ssh_disconnect_all` | Disconnect all connections. |
+
+### Execution
+
+| Tool | Description |
+|------|-------------|
+| `ssh_execute` | Run a command on an existing connection. Required: `command`, `connectionId`. |
+| `ssh_execute_on_multiple` | Run a command on selected connections (`["*"]` or `[]` = all). Runs sequentially. |
+
+### Status and introspection
+
+| Tool | Description |
+|------|-------------|
+| `ssh_get_command_filter` | Show the command filter (whitelist/blacklist, global + per-profile, with precedence rules) and the host filter (allowed/blocked hosts) that apply to a connection; optionally check whether a specific command would be allowed. |
+| `ssh_list_connections` | List active connections with status. |
+| `ssh_check_connections` | Health check all connections (dead socket detection, shell status). |
+| `ssh_failed_connections` | List recent failed connection attempts (from the failed-connections JSONL log). |
+
+### File transfer (SFTP)
+
+| Tool | Description |
+|------|-------------|
+| `ssh_upload_file` | Upload a file via SFTP. |
+| `ssh_download_file` | Download a file via SFTP. |
+| `ssh_list_files` | List a remote directory via SFTP. |
 
 ## Example Workflow
+
+### Single command (one call)
+
+```
+→ ssh_run {
+    host: "172.168.0.2",
+    profile: "ROUTERS",
+    command: "show version"
+  }
+  (connects, runs, closes; returns the output)
+```
+
+### Single command inside a nested CLI (one call)
+
+```
+→ ssh_run_with_jump {
+    host: "10.0.0.1",
+    username: "admin",
+    preset: "topex",
+    jumpCommands: ["telnet lh", "telnet 127.0.0.1"],
+    command: "view portsoncard *"
+  }
+```
+
+### Retry after a failure
+
+```
+1. → ssh_run { host: "172.168.0.2", profile: "ROUTERS", command: "show bogus" }
+   ← { status: "error", connectionId: "172_168_0_2_..._sessionid_a1b2c3", exitCode: 2, ... }
+     (connection left open)
+
+2. → ssh_execute {
+       command: "show interfaces terse",
+       connectionId: "172_168_0_2_..._sessionid_a1b2c3"
+     }
+
+3. → ssh_disconnect { connectionId: "172_168_0_2_..._sessionid_a1b2c3" }
+```
+
+### Fleet operations (persistent connections)
 
 ```
 1. Load connections from CSV (passwords auto-resolved from env vars)
    → ssh_load_connections { filePath: "devices.csv", connectAll: true }
    (ROUTER1_PASSWORD, ROUTER2_PASSWORD resolved automatically)
 
-2. Enter enable mode on Cisco routers
-   → ssh_cisco_enable { connectionId: "router1" }
-   → ssh_cisco_enable { connectionId: "router2" }
-
-3. Execute show commands on all devices
+2. Execute show commands on all devices
    → ssh_execute_on_multiple {
        command: "show ip interface brief",
        connectionIds: ["*"]
      }
 
-4. Execute privileged command on specific router
+3. Execute a command on one specific router
    → ssh_execute {
        command: "show running-config | include hostname",
        connectionId: "router1"
      }
 
-5. Check connection health
+4. Check connection health
    → ssh_check_connections {}
 
-6. Connect to a Topex gateway via jump shell
-   → ssh_connect_with_jump_command {
-       host: "10.0.0.1",
-       username: "admin",
-       connectionId: "topex1",
-       preset: "topex",
-       jumpCommand: "telnet lh"
+5. Inspect why a command was blocked
+   → ssh_get_command_filter {
+       connectionId: "router1",
+       command: "configure terminal"
      }
 
-7. Execute command inside the Topex CLI
-   → ssh_execute {
-       command: "view portsoncard *",
-       connectionId: "topex1"
-     }
-
-8. Disconnect all
+6. Disconnect all
    → ssh_disconnect_all {}
 ```
 
