@@ -896,9 +896,13 @@ class SSHMCPServer {
     }
 
     validateCommandForConnection(command, connectionId) {
-        const base = this.validateCommand(command);
         const connection = this.connections.get(connectionId);
-        const profileFilter = connection?.profileFilter;
+        return this.validateCommandWithProfileFilter(command, connection?.profileFilter, connectionId);
+    }
+
+    // Same layering as validateCommandForConnection, but without needing a live connection.
+    validateCommandWithProfileFilter(command, profileFilter, connectionId = null) {
+        const base = this.validateCommand(command);
         if (!profileFilter) return base;
 
         const lowerCmd = command.trim().toLowerCase();
@@ -1058,16 +1062,78 @@ class SSHMCPServer {
                     },
                 },
                 {
+                    name: 'ssh_run',
+                    description: 'Run one command on a host in a single call. Connects, runs the command, and closes the connection when it succeeds - no connectionId to track. On success returns the command output. On failure returns a JSON object with status error, the connectionId, and the error; the connection stays open so you can retry a different command with ssh_execute. Prefer this over ssh_connect plus ssh_execute.',
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            host: { type: 'string', description: 'SSH server hostname or IP' },
+                            command: { type: 'string', description: 'Command to execute' },
+                            profile: { type: 'string', description: 'Named profile supplying preset credentials, options, and command allow/deny rules.' },
+                            port: { type: 'number', description: 'SSH port', default: 22 },
+                            username: { type: 'string', description: 'Username. Omit when a profile supplies it.' },
+                            password: { type: 'string', description: 'Password. Omit when a profile supplies it.' },
+                            privateKey: { type: 'string', description: 'Path to private key file' },
+                            passphrase: { type: 'string', description: 'Passphrase for private key' },
+                            deviceType: { type: 'string', description: 'Device type: linux, cisco, cisco_xe, cisco_xr, cisco_asa, cisco_nexus, juniper, mikrotik, fortinet, paloalto, sophos, network. Omit when a profile supplies it.', default: 'linux' },
+                            enablePassword: { type: 'string', description: 'Enable password for Cisco devices' },
+                            sshOptions: {
+                                type: 'object',
+                                description: 'SSH -o style options for algorithm negotiation with legacy devices. '
+                                    + 'Keys: KexAlgorithms, HostKeyAlgorithms, Ciphers, MACs. '
+                                    + 'Prefix a value with a plus sign to append to defaults instead of replacing them.',
+                            },
+                            connectionId: { type: 'string', description: 'Optional. Auto-generated if omitted.' },
+                            timeout: { type: 'number', description: 'Timeout in ms', default: 30000 },
+                        },
+                        required: ['host', 'command'],
+                    },
+                },
+                {
+                    name: 'ssh_run_with_jump',
+                    description: 'Run one command inside a nested CLI reached by a jump command (telnet, fs_cli, and similar), in a single call. Give jumpCommands as a list and they are tried in order until one reaches the nested prompt. Connects, runs the command, and closes the connection when it succeeds. On failure returns a JSON object with status error, the connectionId, and the error; the connection stays open so you can retry a different command with ssh_execute.',
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            host: { type: 'string', description: 'SSH server hostname or IP' },
+                            command: { type: 'string', description: 'Command to execute inside the nested CLI' },
+                            jumpCommands: {
+                                type: 'array',
+                                items: { type: 'string' },
+                                description: 'Jump commands to try in order until one reaches the nested prompt, e.g. [telnet lh, telnet 127.0.0.1]. Optional when a profile supplies a jump command.',
+                            },
+                            profile: { type: 'string', description: 'Named profile supplying preset credentials, options, and command allow/deny rules.' },
+                            preset: { type: 'string', description: 'Built-in preset: freeswitch, topex. Supplies the prompt pattern and exit command.' },
+                            jumpPromptPattern: { type: 'string', description: 'Regex matching the nested shell prompt. Required unless a preset supplies it. Shared by every entry in jumpCommands.' },
+                            jumpExitCommand: { type: 'string', description: 'Command to exit the nested shell. Defaults from preset, otherwise exit.' },
+                            jumpReadyTimeout: { type: 'number', description: 'Timeout in ms waiting for the nested prompt, per attempt.', default: 5000 },
+                            port: { type: 'number', description: 'SSH port', default: 22 },
+                            username: { type: 'string', description: 'SSH username. Omit when a profile supplies it.' },
+                            password: { type: 'string', description: 'SSH password. Omit when a profile supplies it.' },
+                            privateKey: { type: 'string', description: 'Path to private key file' },
+                            passphrase: { type: 'string', description: 'Passphrase for private key' },
+                            sshOptions: {
+                                type: 'object',
+                                description: 'SSH -o style options for algorithm negotiation. '
+                                    + 'Keys: KexAlgorithms, HostKeyAlgorithms, Ciphers, MACs.',
+                            },
+                            connectionId: { type: 'string', description: 'Optional. Auto-generated if omitted.' },
+                            timeout: { type: 'number', description: 'Timeout in ms', default: 30000 },
+                        },
+                        required: ['host', 'command'],
+                    },
+                },
+                {
                     name: 'ssh_execute',
-                    description: 'Run a command on a connection. Large output is returned as a downloadable URI instead of inline.',
+                    description: 'Run a command on an existing connection from ssh_connect, or retry after a failed ssh_run. Large output is returned as a downloadable URI instead of inline.',
                     inputSchema: {
                         type: 'object',
                         properties: {
                             command: { type: 'string', description: 'Command to execute' },
-                            connectionId: { type: 'string', description: 'Connection ID', default: 'default' },
+                            connectionId: { type: 'string', description: 'Connection ID returned by ssh_connect or by a failed ssh_run' },
                             timeout: { type: 'number', description: 'Timeout in ms', default: 30000 },
                         },
-                        required: ['command'],
+                        required: ['command', 'connectionId'],
                     },
                 },
                 {
@@ -1195,6 +1261,8 @@ class SSHMCPServer {
                     case 'ssh_connect': return await this.handleSSHConnect(args);
                     case 'ssh_connect_with_jump_command': return await this.handleSSHConnectWithJump(args);
                     case 'ssh_load_connections': return await this.handleLoadConnections(args);
+                    case 'ssh_run': return await this.handleRunCommand(args);
+                    case 'ssh_run_with_jump': return await this.handleRunCommandWithJump(args);
                     case 'ssh_execute': return await this.handleSSHExecute(args);
                     case 'ssh_execute_on_multiple': return await this.handleExecuteOnMultiple(args);
                     case 'ssh_disconnect': return await this.handleSSHDisconnect(args);
@@ -1824,6 +1892,7 @@ class SSHMCPServer {
             result = await this.executeViaExec(connection, command, timeout, connectionId);
         }
 
+        connection.lastExitCode = result._exitCode ?? null;
         this.recordAudit({ connectionId, host: connection.host, command, output: result._rawOutput ?? '', exitCode: result._exitCode ?? null });
 
         const handled = await this.uploadLargeOutput({ connectionId, command, header: result._header ?? '', output: result._rawOutput ?? '' });
@@ -2126,6 +2195,125 @@ class SSHMCPServer {
                 ).join('\n\n---\n\n')}`,
             }],
         };
+    }
+
+    // ===========================================================================
+    // ONE-SHOT RUN (connect + execute + close)
+    // ===========================================================================
+
+    // Keep the connection alive so the caller can retry a different command on it.
+    _runFailure(connectionId, command, error, extra = {}) {
+        logger.warn(`Run failed, keeping connection open for retry`, { connectionId, error });
+        const payload = {
+            status: 'error',
+            connectionId,
+            command,
+            error,
+            ...extra,
+            retry: 'The SSH connection is still open. Call ssh_execute with this connectionId to run a different command, then ssh_disconnect when finished.',
+        };
+        return {
+            content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+            structuredContent: payload,
+        };
+    }
+
+    // Execute on an already-open connection, then close it only if the command succeeded.
+    async _executeThenClose(connectionId, command, timeout) {
+        let result;
+        try {
+            result = await this.handleSSHExecute({ command, connectionId, timeout });
+        } catch (error) {
+            // handleSSHExecute drops dead connections from the map - nothing left to retry on.
+            if (!this.connections.has(connectionId)) throw error;
+            return this._runFailure(connectionId, command, error.message);
+        }
+
+        const exitCode = this.connections.get(connectionId)?.lastExitCode ?? null;
+        if (exitCode !== null && exitCode !== 0) {
+            return this._runFailure(connectionId, command, `Command exited with code ${exitCode}`, {
+                exitCode,
+                output: result.content?.[0]?.text ?? '',
+            });
+        }
+
+        try {
+            await this.handleSSHDisconnect({ connectionId });
+        } catch (e) {
+            logger.warn(`Disconnect after successful run failed`, { connectionId, error: e.message });
+        }
+        return result;
+    }
+
+    // Reject a blocked command before spending an SSH session on it.
+    _preflightCommand(command, resolved, host, connectionId) {
+        const check = this.validateCommandWithProfileFilter(command, resolved.profileFilter || null, connectionId);
+        if (!check.allowed) {
+            this.recordAudit({ connectionId: connectionId || null, host, command, output: check.reason, blocked: true });
+            throw new Error(`Command blocked: ${check.reason}`);
+        }
+    }
+
+    async handleRunCommand(args) {
+        const { command, timeout = 30000 } = args;
+        if (!command) throw new Error('command is required');
+
+        const resolved = this.resolveCredentialsFromEnv(args);
+        const host = resolved.host || resolved.hostname;
+        if (!host) throw new Error('host is required');
+
+        this._preflightCommand(command, resolved, host, args.connectionId);
+
+        const connectionId = args.connectionId || this.generateConnectionId(host);
+        await this.handleSSHConnect({ ...args, connectionId });
+
+        return this._executeThenClose(connectionId, command, timeout);
+    }
+
+    async handleRunCommandWithJump(args) {
+        const { command, timeout = 30000 } = args;
+        if (!command) throw new Error('command is required');
+
+        const resolved = this.resolveCredentialsFromEnv(args);
+        const host = resolved.host || resolved.hostname;
+        if (!host) throw new Error('host is required');
+
+        const candidates = (Array.isArray(args.jumpCommands) ? args.jumpCommands : [])
+            .map(c => typeof c === 'string' ? c.trim() : '')
+            .filter(Boolean);
+        if (candidates.length === 0 && resolved.jumpCommand) candidates.push(resolved.jumpCommand);
+        if (candidates.length === 0) {
+            throw new Error('jumpCommands is required: a list of jump commands to try in order, e.g. [telnet lh, telnet 127.0.0.1]');
+        }
+
+        this._preflightCommand(command, resolved, host, args.connectionId);
+
+        // Surface a bad jump config now instead of once per candidate.
+        this.resolveJumpShellConfig({ ...resolved, jumpCommand: candidates[0] });
+
+        const baseId = args.connectionId || this.generateConnectionId(host);
+        const failures = [];
+        let activeId = null;
+
+        for (let i = 0; i < candidates.length; i++) {
+            // Distinct id per attempt: a failed attempt's late close event must not delete a later winner.
+            const attemptId = i === 0 ? baseId : `${baseId}_r${i + 1}`;
+            try {
+                await this.handleSSHConnectWithJump({ ...args, connectionId: attemptId, jumpCommand: candidates[i] });
+                activeId = attemptId;
+                logger.info(`Jump command succeeded`, { connectionId: attemptId, jumpCommand: candidates[i], attempt: i + 1 });
+                break;
+            } catch (error) {
+                failures.push(`[${candidates[i]}] ${error.message}`);
+                logger.warn(`Jump command failed, trying next`, { jumpCommand: candidates[i], attempt: i + 1, error: error.message });
+            }
+        }
+
+        if (!activeId) {
+            throw new Error(`All ${candidates.length} jump command(s) failed. ${failures.join(' | ')}`);
+        }
+
+        return this._executeThenClose(activeId, command, timeout);
     }
 
     // ===========================================================================
