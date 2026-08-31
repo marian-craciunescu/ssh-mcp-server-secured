@@ -302,7 +302,22 @@ Connects, runs the command, and closes the connection. Returns the command outpu
 
 All four keys are always present on failure, so a consumer can read them without existence checks.
 
-`connectionId` is `null` whenever there is nothing to retry on — bad credentials, a blocked command, a failed jump, or a connection the remote host dropped. When it is a string, the connection is live: retry with `ssh_execute` using that id, then `ssh_disconnect`. Abandoned connections are reaped by `SSH_IDLE_TIMEOUT` (default 120s).
+`connectionId` is `null` whenever there is nothing to retry on — bad credentials, a blocked command, a failed jump, or a connection the remote host dropped.
+
+When it is a string, the connection is live. **Retry by calling `ssh_run` again with that `connectionId`** — no host, no credentials, no reconnect:
+
+```json
+{
+  "connectionId": "10_1_2_15_2026_08_12_sessionid_a1b2c3",
+  "command": "show interfaces terse"
+}
+```
+
+The whole loop stays inside one tool. If the retry succeeds the connection is closed as usual; if it fails again you get the same `connectionId` back and can try once more. Abandoned connections are reaped by `SSH_IDLE_TIMEOUT` (default 120s), so a forgotten retry cleans itself up.
+
+The command filter for a reused connection comes from the connection itself, so a retry does not need to resend `profile` — per-profile whitelist/blacklist rules still apply.
+
+`ssh_run_with_jump` reuses connections the same way, and skips the jump entirely: you are already inside the nested CLI, so a retry needs only `connectionId` and `command`.
 
 Profiles, whitelist/blacklist, host filter, audit logging, pager handling, and large-output offload all behave exactly as with `ssh_connect` + `ssh_execute`. A command blocked by the filter is rejected **before** any SSH session is opened.
 
@@ -731,8 +746,8 @@ These patterns are **always blocked** regardless of filter mode:
 
 | Tool | Description |
 |------|-------------|
-| `ssh_run` | Connect, run one command, and close the connection on success — one call, no connectionId to track. On failure returns `{ isError, connectionId, error }`; when `connectionId` is non-null the connection is still open, so you can retry a different command with `ssh_execute`. Required: `host`, `command`. |
-| `ssh_run_with_jump` | Same as `ssh_run`, including the failure shape, but enters a nested CLI first. Takes `jumpCommands` as a list and tries them in order until one reaches the nested prompt. Required: `host`, `command`. |
+| `ssh_run` | Connect, run one command, and close the connection on success — one call, no connectionId to track. On failure returns `{ isError, connectionId, exitCode, error }`; when `connectionId` is non-null the connection is still open, so call `ssh_run` again with that id to retry on it. Required: `command`, plus `host` unless reusing a connectionId. |
+| `ssh_run_with_jump` | Same as `ssh_run`, including the failure shape and connectionId reuse, but enters a nested CLI first. Takes `jumpCommands` as a list and tries them in order until one reaches the nested prompt. Reusing a connectionId skips the jump. Required: `command`, plus `host` unless reusing a connectionId. |
 
 ### Connection management
 
@@ -800,12 +815,12 @@ These patterns are **always blocked** regardless of filter mode:
    ← { isError: true, connectionId: "172_168_0_2_..._sessionid_a1b2c3", exitCode: 2, error: "..." }
      (connectionId is a string, so the connection is still open)
 
-2. → ssh_execute {
-       command: "show interfaces terse",
-       connectionId: "172_168_0_2_..._sessionid_a1b2c3"
+2. → ssh_run {
+       connectionId: "172_168_0_2_..._sessionid_a1b2c3",
+       command: "show interfaces terse"
      }
-
-3. → ssh_disconnect { connectionId: "172_168_0_2_..._sessionid_a1b2c3" }
+     (reuses the open connection - no host, no credentials, no reconnect)
+   ← the command output; the connection is closed on success
 ```
 
 ### Fleet operations (persistent connections)

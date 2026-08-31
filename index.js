@@ -1063,11 +1063,11 @@ class SSHMCPServer {
                 },
                 {
                     name: 'ssh_run',
-                    description: 'Run one command on a host in a single call. Connects, runs the command, and closes the connection when it succeeds - no connectionId to track. On success returns the command output. On failure returns JSON with isError true, a connectionId, and an error field; if connectionId is not null the connection is still open, so retry a different command with ssh_execute using it. Prefer this over ssh_execute.',
+                    description: 'Run one command on a host in a single call. Connects, runs the command, and closes the connection when it succeeds, no connectionId to track. On success returns the command output. On failure returns JSON with isError true, a connectionId, an exitCode, and an error field; if connectionId is not null the connection is still open, so call ssh_run again with that connectionId and a different command to retry.',
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            host: { type: 'string', description: 'SSH server hostname or IP' },
+                            host: { type: 'string', description: 'SSH server hostname or IP. Not needed when reusing a connectionId from a previous run.' },
                             command: { type: 'string', description: 'Command to execute' },
                             profile: { type: 'string', description: 'Named profile supplying preset credentials, options, and command allow/deny rules.' },
                             port: { type: 'number', description: 'SSH port', default: 22 },
@@ -1083,19 +1083,19 @@ class SSHMCPServer {
                                     + 'Keys: KexAlgorithms, HostKeyAlgorithms, Ciphers, MACs. '
                                     + 'Prefix a value with a plus sign to append to defaults instead of replacing them.',
                             },
-                            connectionId: { type: 'string', description: 'Optional. Auto-generated if omitted.' },
+                            connectionId: { type: 'string', description: 'Optional. Pass the connectionId from a failed run to reuse that open connection instead of connecting again. Auto-generated if omitted.' },
                             timeout: { type: 'number', description: 'Timeout in ms', default: 30000 },
                         },
-                        required: ['host', 'command'],
+                        required: ['command'],
                     },
                 },
                 {
                     name: 'ssh_run_with_jump',
-                    description: 'Run one command inside a nested CLI reached by a jump command (telnet, fs_cli, and similar), in a single call. Give jumpCommands as a list and they are tried in order until one reaches the nested prompt. Connects, runs the command, and closes the connection when it succeeds. On failure returns JSON with isError true, a connectionId, and an error field; if connectionId is not null the connection is still open, so retry a different command with ssh_execute using it.',
+                    description: 'Run one command inside a nested CLI reached by a jump command (telnet, fs_cli, and similar), in a single call. Give jumpCommands as a list and they are tried in order until one reaches the nested prompt. Connects, runs the command, and closes the connection when it succeeds. On failure returns JSON with isError true, a connectionId, an exitCode, and an error field; if connectionId is not null the connection is still open inside the nested CLI, so call ssh_run_with_jump again with that connectionId and a different command to retry.',
                     inputSchema: {
                         type: 'object',
                         properties: {
-                            host: { type: 'string', description: 'SSH server hostname or IP' },
+                            host: { type: 'string', description: 'SSH server hostname or IP. Not needed when reusing a connectionId from a previous run.' },
                             command: { type: 'string', description: 'Command to execute inside the nested CLI' },
                             jumpCommands: {
                                 type: 'array',
@@ -1117,10 +1117,10 @@ class SSHMCPServer {
                                 description: 'SSH -o style options for algorithm negotiation. '
                                     + 'Keys: KexAlgorithms, HostKeyAlgorithms, Ciphers, MACs.',
                             },
-                            connectionId: { type: 'string', description: 'Optional. Auto-generated if omitted.' },
+                            connectionId: { type: 'string', description: 'Optional. Pass the connectionId from a failed run to reuse that open nested-CLI session instead of connecting and jumping again. Auto-generated if omitted.' },
                             timeout: { type: 'number', description: 'Timeout in ms', default: 30000 },
                         },
-                        required: ['host', 'command'],
+                        required: ['command'],
                     },
                 },
                 {
@@ -2241,6 +2241,15 @@ class SSHMCPServer {
         return result;
     }
 
+    // Retry path: run on a connection a previous failed run left open, no reconnect.
+    async _runOnExisting(connectionId, command, timeout) {
+        const existing = this.connections.get(connectionId);
+        logger.info(`Reusing open connection`, { connectionId, host: existing.host });
+        // Filter comes from the connection, so a retry does not have to resend profile.
+        this._preflightCommand(command, { profileFilter: existing.profileFilter }, existing.host, connectionId);
+        return this._executeThenClose(connectionId, command, timeout);
+    }
+
     // Reject a blocked command before spending an SSH session on it.
     _preflightCommand(command, resolved, host, connectionId) {
         const check = this.validateCommandWithProfileFilter(command, resolved.profileFilter || null, connectionId);
@@ -2256,9 +2265,16 @@ class SSHMCPServer {
             const { command, timeout = 30000 } = args;
             if (!command) throw new Error('command is required');
 
+            if (args.connectionId && this.connections.has(args.connectionId)) {
+                connectionId = args.connectionId;
+                return await this._runOnExisting(connectionId, command, timeout);
+            }
+
             const resolved = this.resolveCredentialsFromEnv(args);
             const host = resolved.host || resolved.hostname;
-            if (!host) throw new Error('host is required');
+            if (!host) {
+                throw new Error('host is required (or pass the connectionId of a connection left open by a previous run)');
+            }
 
             this._preflightCommand(command, resolved, host, args.connectionId);
 
@@ -2277,9 +2293,17 @@ class SSHMCPServer {
             const { command, timeout = 30000 } = args;
             if (!command) throw new Error('command is required');
 
+            // Already inside the nested shell - just run, no reconnect and no jump replay.
+            if (args.connectionId && this.connections.has(args.connectionId)) {
+                activeId = args.connectionId;
+                return await this._runOnExisting(activeId, command, timeout);
+            }
+
             const resolved = this.resolveCredentialsFromEnv(args);
             const host = resolved.host || resolved.hostname;
-            if (!host) throw new Error('host is required');
+            if (!host) {
+                throw new Error('host is required (or pass the connectionId of a connection left open by a previous run)');
+            }
 
             const candidates = (Array.isArray(args.jumpCommands) ? args.jumpCommands : [])
                 .map(c => typeof c === 'string' ? c.trim() : '')
