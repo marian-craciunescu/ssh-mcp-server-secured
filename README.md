@@ -282,21 +282,27 @@ Network devices use PTY-allocated persistent shell sessions instead of standard 
 
 Connects, runs the command, and closes the connection. Returns the command output — no connectionId to track.
 
-**On failure the connection is kept open** so you can retry a different command. The result is a structured object (returned both as JSON text and in `structuredContent`):
+**Every failure returns the same four fields**, as JSON text and in `structuredContent`:
 
 ```json
 {
-  "status": "error",
+  "isError": true,
   "connectionId": "10_1_2_15_2026_08_12_sessionid_a1b2c3",
-  "command": "show bogus",
-  "error": "Command exited with code 2",
   "exitCode": 2,
-  "output": "% Invalid input detected",
-  "retry": "The SSH connection is still open. Call ssh_execute with this connectionId to run a different command, then ssh_disconnect when finished."
+  "error": "Command exited with code 2: % Invalid input detected"
 }
 ```
 
-Retry with `ssh_execute` using that `connectionId`, then `ssh_disconnect`. Abandoned connections are reaped by `SSH_IDLE_TIMEOUT` (default 120s).
+| Field | Meaning |
+|-------|---------|
+| `isError` | Always `true` on failure. Absent on success — a successful run returns the raw command output, not JSON. |
+| `connectionId` | The still-open connection to retry on, or `null` when no connection is open. |
+| `exitCode` | The command's exit code, or `null` when the command never produced one — a connect failure, a timeout, a blocked command, or a network device on the persistent-shell path. |
+| `error` | The error message. |
+
+All four keys are always present on failure, so a consumer can read them without existence checks.
+
+`connectionId` is `null` whenever there is nothing to retry on — bad credentials, a blocked command, a failed jump, or a connection the remote host dropped. When it is a string, the connection is live: retry with `ssh_execute` using that id, then `ssh_disconnect`. Abandoned connections are reaped by `SSH_IDLE_TIMEOUT` (default 120s).
 
 Profiles, whitelist/blacklist, host filter, audit logging, pager handling, and large-output offload all behave exactly as with `ssh_connect` + `ssh_execute`. A command blocked by the filter is rejected **before** any SSH session is opened.
 
@@ -725,8 +731,8 @@ These patterns are **always blocked** regardless of filter mode:
 
 | Tool | Description |
 |------|-------------|
-| `ssh_run` | Connect, run one command, and close the connection on success — one call, no connectionId to track. On failure the connection is left open and its `connectionId` is returned so you can retry a different command with `ssh_execute`. Required: `host`, `command`. |
-| `ssh_run_with_jump` | Same as `ssh_run`, but enters a nested CLI first. Takes `jumpCommands` as a list and tries them in order until one reaches the nested prompt. Required: `host`, `command`. |
+| `ssh_run` | Connect, run one command, and close the connection on success — one call, no connectionId to track. On failure returns `{ isError, connectionId, error }`; when `connectionId` is non-null the connection is still open, so you can retry a different command with `ssh_execute`. Required: `host`, `command`. |
+| `ssh_run_with_jump` | Same as `ssh_run`, including the failure shape, but enters a nested CLI first. Takes `jumpCommands` as a list and tries them in order until one reaches the nested prompt. Required: `host`, `command`. |
 
 ### Connection management
 
@@ -791,8 +797,8 @@ These patterns are **always blocked** regardless of filter mode:
 
 ```
 1. → ssh_run { host: "172.168.0.2", profile: "ROUTERS", command: "show bogus" }
-   ← { status: "error", connectionId: "172_168_0_2_..._sessionid_a1b2c3", exitCode: 2, ... }
-     (connection left open)
+   ← { isError: true, connectionId: "172_168_0_2_..._sessionid_a1b2c3", exitCode: 2, error: "..." }
+     (connectionId is a string, so the connection is still open)
 
 2. → ssh_execute {
        command: "show interfaces terse",
