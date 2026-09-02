@@ -138,6 +138,24 @@ function stripPagerArtifacts(text) {
     return text.replace(PAGER_STRIP_PATTERN, '').replace(/\r/g, '');
 }
 
+// Shell-path devices report no exit code, so a failed command is only visible as
+// an error string in the output. These are matched per line, anchored, so output
+// that merely contains a word like "more" or "%" does not false-positive.
+const POSIX_SHELL_ERRORS = '^[^\\r\\n]{1,80}: (no such file or directory|not found|command not found|permission denied|is a directory|not a directory|operation not permitted|cannot access|cannot open|cannot create|cannot remove|invalid option|bad substitution|syntax error)\\b';
+const CISCO_SHELL_ERRORS = '^%\\s*(invalid input|incomplete command|ambiguous command|unknown command|unrecognized command|bad mask|bad ip address|permission denied|authorization failed)';
+const DEFAULT_SHELL_ERROR_PATTERNS = {
+    _default: POSIX_SHELL_ERRORS,
+    cisco: CISCO_SHELL_ERRORS,
+    cisco_xe: CISCO_SHELL_ERRORS,
+    cisco_xr: CISCO_SHELL_ERRORS,
+    cisco_asa: CISCO_SHELL_ERRORS,
+    cisco_nexus: CISCO_SHELL_ERRORS,
+    juniper: '^(error:|syntax error|unknown command)',
+    fortinet: '^(unknown action|command parse error|command fail\\. return code)',
+    mikrotik: '^(bad command name|expected end of command|syntax error|no such item|input does not match)',
+    paloalto: '^(invalid syntax|unknown command|server error)',
+};
+
 // =============================================================================
 // JUMP SHELL PRESETS
 // =============================================================================
@@ -426,6 +444,25 @@ class SSHMCPServer {
             }
         }
 
+        // jumpCommands is a list of fallback candidates for ssh_run_with_jump.
+        // JSON array or comma-separated; entries are kept verbatim, not lowercased.
+        if (!resolved.jumpCommands) {
+            const envKey = `PROFILE_${name}_JUMP_COMMANDS`;
+            const envValue = process.env[envKey];
+            if (envValue) {
+                try {
+                    const arr = envValue.trim().startsWith('[') ? JSON.parse(envValue) : envValue.split(',');
+                    const list = arr.map(c => typeof c === 'string' ? c.trim() : '').filter(Boolean);
+                    if (list.length > 0) {
+                        resolved.jumpCommands = list;
+                        logger.info(`Profile ${args.profile}: resolved ${list.length} jumpCommands from ${envKey}`);
+                    }
+                } catch (e) {
+                    logger.warn(`Profile ${args.profile}: invalid JSON in ${envKey}`, { error: e.message });
+                }
+            }
+        }
+
         // Per-profile command filter from PROFILE_<NAME>_WHITELIST / _BLACKLIST
         const parseList = (val) => {
             if (!val) return null;
@@ -444,6 +481,14 @@ class SSHMCPServer {
         const pagerEnv = process.env[`PROFILE_${name}_DISABLE_PAGER`];
         if (pagerEnv !== undefined) {
             resolved.disablePager = pagerEnv !== 'false';
+        }
+
+        // Per-profile shell error regex: PROFILE_<NAME>_SHELL_ERROR_REGEX beats every
+        // env-level pattern for this connection. Empty string disables detection.
+        const errRegexEnv = process.env[`PROFILE_${name}_SHELL_ERROR_REGEX`];
+        if (errRegexEnv !== undefined && resolved.shellErrorRegex === undefined) {
+            resolved.shellErrorRegex = errRegexEnv;
+            logger.info(`Profile ${args.profile}: resolved shellErrorRegex from PROFILE_${name}_SHELL_ERROR_REGEX`);
         }
 
         return resolved;
@@ -584,6 +629,52 @@ class SSHMCPServer {
             return connectionInfo.disablePager;
         }
         return process.env.SSH_DISABLE_PAGER !== 'false';
+    }
+
+    // Error regex resolution: the connection's per-profile regex beats
+    // SSH_SHELL_ERROR_REGEX_<TYPE>, which beats the global SSH_SHELL_ERROR_REGEX,
+    // which beats the built-in default. Empty string at any level disables.
+    _shellErrorPatternFor(deviceType, profileRegex) {
+        const dt = (deviceType || '').toLowerCase();
+        const perType = process.env[`SSH_SHELL_ERROR_REGEX_${dt.toUpperCase()}`];
+        const global = process.env.SSH_SHELL_ERROR_REGEX;
+        let source;
+        if (typeof profileRegex === 'string') source = profileRegex;
+        else if (perType !== undefined) source = perType;
+        else if (global !== undefined) source = global;
+        else source = DEFAULT_SHELL_ERROR_PATTERNS[dt] ?? DEFAULT_SHELL_ERROR_PATTERNS._default;
+        if (!source) return null;
+        try {
+            return new RegExp(source, 'i');
+        } catch (e) {
+            logger.warn('Invalid shell error regex, detection disabled', { deviceType: dt, error: e.message });
+            return null;
+        }
+    }
+
+    // Returns the offending line, or null. Matched line by line so an anchored
+    // pattern cannot straddle lines and the trailing prompt is skipped naturally.
+    _detectShellError(output, command, connectionInfo) {
+        if (process.env.SSH_DETECT_SHELL_ERRORS === 'false') return null;
+        if (!output) return null;
+        const pattern = this._shellErrorPatternFor(connectionInfo?.deviceType, connectionInfo?.shellErrorRegex);
+        if (!pattern) return null;
+        const lines = output.split('\n');
+        const cmd = (command || '').trim();
+        // Shell output opens with the echoed command; matching it would false-positive
+        // on a command that merely mentions an error string.
+        if (lines.length && cmd && lines[0].trim() === cmd) lines.shift();
+        for (const line of lines) {
+            if (pattern.test(line)) {
+                return line.trim().replace(/[^\x20-\x7E]/g, '').slice(0, 200);
+            }
+        }
+        return null;
+    }
+
+    _shellErrorExitCode() {
+        const n = parseInt(process.env.SSH_SHELL_ERROR_EXIT_CODE || '1', 10);
+        return Number.isFinite(n) ? n : 1;
     }
 
     // ===========================================================================
@@ -932,7 +1023,7 @@ class SSHMCPServer {
         return base;
     }
 
-    recordAudit({ connectionId, host, command, output, exitCode = null, blocked = false }) {
+    recordAudit({ connectionId, host, command, output, exitCode = null, blocked = false, deviceError = null }) {
         if (!this.auditEnabled) return;
         try {
             const day = new Date().toISOString().slice(0, 10);
@@ -943,6 +1034,7 @@ class SSHMCPServer {
                 command,
                 blocked,
                 exitCode,
+                deviceError,
                 output: output == null ? '' : String(output),
             });
             appendFileSync(resolve(this.auditDir, `audit_${day}.jsonl`), line + '\n');
@@ -1183,6 +1275,18 @@ class SSHMCPServer {
                     },
                 },
                 {
+                    name: 'ssh_get_profile_config',
+                    description: 'Show which commands a named profile permits, without connecting: the effective allowed and blocked sets after the profile filter is layered on the global command filter. Use to see exactly what a profile can run before opening a session.',
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            profileName: { type: 'string', description: 'Profile name, e.g. TOPEX. Case-insensitive.' },
+                            command: { type: 'string', description: 'Optional. If provided, also returns whether this command would be allowed under this profile and why.' },
+                        },
+                        required: ['profileName'],
+                    },
+                },
+                {
                     name: 'ssh_list_connections',
                     description: 'List all active SSH connections',
                     inputSchema: {
@@ -1268,6 +1372,7 @@ class SSHMCPServer {
                     case 'ssh_disconnect': return await this.handleSSHDisconnect(args);
                     case 'ssh_disconnect_all': return await this.handleDisconnectAll();
                     case 'ssh_get_command_filter': return await this.handleGetCommandFilter(args);
+                    case 'ssh_get_profile_config': return await this.handleGetProfileConfig(args);
                     case 'ssh_list_connections': return await this.handleListConnections();
                     case 'ssh_check_connections': return await this.handleCheckConnections();
                     case 'ssh_upload_file': return await this.handleSSHUploadFile(args);
@@ -1390,6 +1495,7 @@ class SSHMCPServer {
                     enablePassword,
                     profileFilter,
                     disablePager: resolved.disablePager,
+                    shellErrorRegex: resolved.shellErrorRegex,
                     jumpConfig: null,
                     jumpShellActive: false,
                     shell: null,
@@ -1687,6 +1793,7 @@ class SSHMCPServer {
                     enablePassword: null,
                     profileFilter,
                     disablePager: resolved.disablePager,
+                    shellErrorRegex: resolved.shellErrorRegex,
                     jumpConfig,
                     jumpShellActive: false,
                     shell: null,
@@ -1893,7 +2000,7 @@ class SSHMCPServer {
         }
 
         connection.lastExitCode = result._exitCode ?? null;
-        this.recordAudit({ connectionId, host: connection.host, command, output: result._rawOutput ?? '', exitCode: result._exitCode ?? null });
+        this.recordAudit({ connectionId, host: connection.host, command, output: result._rawOutput ?? '', exitCode: result._exitCode ?? null, deviceError: result._deviceError ?? null });
 
         const handled = await this.uploadLargeOutput({ connectionId, command, header: result._header ?? '', output: result._rawOutput ?? '' });
         return { content: [{ type: 'text', text: handled.text }] };
@@ -1967,7 +2074,13 @@ class SSHMCPServer {
                         const output = stripPagerArtifacts(connection.shellBuffer);
                         logger.debug(`Shell command complete`, { connectionId, outputLength: output.length, pageCount });
 
-                        const header = `[${connectionId}] Command: ${command}\nOutput:\n`;
+                        const deviceError = this._detectShellError(output, command, connection);
+                        if (deviceError) {
+                            logger.warn(`Device reported an error`, { connectionId, command, deviceError });
+                        }
+                        const header = deviceError
+                            ? `[${connectionId}] Command: ${command}\nDevice Error: ${deviceError}\nOutput:\n`
+                            : `[${connectionId}] Command: ${command}\nOutput:\n`;
                         resolve({
                             content: [{
                                 type: 'text',
@@ -1975,7 +2088,8 @@ class SSHMCPServer {
                             }],
                             _header: header,
                             _rawOutput: output,
-                            _exitCode: null,
+                            _exitCode: deviceError ? this._shellErrorExitCode() : null,
+                            _deviceError: deviceError,
                         });
                     }
                 } else {
@@ -2308,6 +2422,10 @@ class SSHMCPServer {
             const candidates = (Array.isArray(args.jumpCommands) ? args.jumpCommands : [])
                 .map(c => typeof c === 'string' ? c.trim() : '')
                 .filter(Boolean);
+            // Profile fallback order: the plural list first, then the single command.
+            if (candidates.length === 0 && Array.isArray(resolved.jumpCommands)) {
+                candidates.push(...resolved.jumpCommands.map(c => typeof c === 'string' ? c.trim() : '').filter(Boolean));
+            }
             if (candidates.length === 0 && resolved.jumpCommand) candidates.push(resolved.jumpCommand);
             if (candidates.length === 0) {
                 throw new Error('jumpCommands is required: a list of jump commands to try in order, e.g. [telnet lh, telnet 127.0.0.1]');
@@ -2576,6 +2694,71 @@ class SSHMCPServer {
             const decision = this.validateCommand(command);
             result.commandCheck = { command, allowed: decision.allowed, reason: decision.reason };
         }
+
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    async handleGetProfileConfig(args) {
+        const { profileName, command } = args || {};
+        if (!profileName) {
+            throw new Error('profileName is required (e.g. TOPEX)');
+        }
+
+        const resolved = this.resolveProfile({ profile: profileName });
+        const pf = resolved.profileFilter || null;
+
+        const global = {
+            mode: this.commandFilter.mode,
+            whitelist: this.commandFilter.whitelistArray || [],
+            blacklist: this.commandFilter.blacklistArray || [],
+        };
+        const profile = {
+            whitelist: pf?.whitelist || [],
+            blacklist: pf?.blacklist || [],
+        };
+
+        // Every entry named at either level, each run through the real layered
+        // validator, so this cannot drift from what execute time actually does.
+        const entries = [...new Set([
+            ...global.whitelist, ...global.blacklist,
+            ...profile.whitelist, ...profile.blacklist,
+        ])].sort();
+        // A whitelist at either level closes the set: unlisted commands are blocked.
+        // Only then is an allowed list worth listing; in blacklist/disabled mode
+        // everything unnamed is permitted, so the deny list is the whole story.
+        const closed = profile.whitelist.length > 0 || global.mode === 'whitelist' || global.mode === 'mixed';
+
+        const allowed = closed ? [] : null;
+        const blocked = [];
+        for (const entry of entries) {
+            const decision = this.validateCommandWithProfileFilter(entry, pf);
+            if (decision.allowed) {
+                if (allowed) allowed.push(entry);
+                continue;
+            }
+            // In a closed set, "not in whitelist" denials just restate the allowed
+            // list. Keep only explicit denials (blacklist, sudo, dangerous pattern).
+            if (closed && /not in .*whitelist/i.test(decision.reason)) continue;
+            blocked.push(entry);
+        }
+
+        const result = {
+            profileName,
+            effective: {
+                allowed,
+                blocked,
+            },
+            note: closed
+                ? 'allowed is the COMPLETE set of commands permitted for this profile; anything not listed is blocked. blocked lists only explicit denials (blacklist, sudo, dangerous pattern).'
+                : 'allowed is null because this mode permits any command that is not in blocked. Dangerous patterns are always blocked regardless.',
+        };
+
+        if (command) {
+            const decision = this.validateCommandWithProfileFilter(command, pf);
+            result.commandCheck = { command, allowed: decision.allowed, reason: decision.reason };
+        }
+
+        logger.debug('Profile config inspected', { profileName, allowed: allowed ? allowed.length : 'any', blocked: blocked.length });
 
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
