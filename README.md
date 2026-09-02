@@ -207,6 +207,7 @@ BELOW is an example of how profile env vars are resolved when loading connection
 | PROFILE_CISCO_DEVICE_TYPE     | deviceType                  | cisco|
 | PROFILE_CISCO_SSH_OPTIONS     | sshOptions (parsed as JSON) | {"KexAlgorithms":"+diffie-hellman-group-exchange-sha1","HostKeyAlgorithms":"+ssh-rsa"}|
 | PROFILE_CISCO_JUMP_COMMAND    | jumpCommand                 | telnet lh |
+| PROFILE_CISCO_JUMP_COMMANDS   | jumpCommands - fallback list for `ssh_run_with_jump`, tried in order (comma-separated or JSON array) | ["telnet lh", "telnet lh 601"] |
 | PROFILE_CISCO_PRESET          | preset                      | topex |
 | PROFILE_CISCO_PORT            | port                        | 2222 |
 | PROFILE_CISCO_WHITELIST       | per-profile command whitelist (comma-separated or JSON array) | show ospf neigh,show version |
@@ -236,6 +237,8 @@ ssh_connect host=10.0.0.1 profile=ROUTERS connectionId=router1
 ```
 
 `PROFILE_<NAME>_DISABLE_PAGER=false` turns off pager suppression for connections using that profile, overriding the global `SSH_DISABLE_PAGER` default.
+
+`PROFILE_<NAME>_SHELL_ERROR_REGEX` sets a custom error pattern for connections using that profile, overriding every env-level pattern. Use it for devices with app-specific error strings the built-in patterns do not know. An empty value disables error detection for that profile.
 
 
 **Usage:**
@@ -339,7 +342,7 @@ Same one-call flow, but enters a nested CLI first. `jumpCommands` is a list trie
 
 If `telnet lh` fails to reach the prompt, `telnet 127.0.0.1` is tried. Each attempt is a fresh connection, so a half-open telnet from a failed attempt cannot corrupt the next one. If every candidate fails, the error lists what each one returned.
 
-All candidates share one `jumpPromptPattern` (supplied directly or via `preset`). When candidates need *different* prompt patterns, use `ssh_connect_with_jump_command` instead. `PROFILE_<NAME>_JUMP_COMMAND` supplies a single candidate when `jumpCommands` is omitted.
+All candidates share one `jumpPromptPattern` (supplied directly or via `preset`). When candidates need *different* prompt patterns, use `ssh_connect_with_jump_command` instead. When `jumpCommands` is omitted, a profile supplies the candidates: `PROFILE_<NAME>_JUMP_COMMANDS` (a JSON array or comma-separated list, tried in order) is used first, falling back to the single `PROFILE_<NAME>_JUMP_COMMAND`.
 
 ### 5. Execute on Multiple Connections
 
@@ -494,6 +497,11 @@ Log format:
 | `SSH_PAGER_REGEX` | regex string | built-in | Override the pattern used to detect a pager prompt |
 | `SSH_PAGER_ADVANCE_KEY` | string | `" "` (space) | Key sent to advance to the next pager page |
 | `SSH_MAX_PAGER_PAGES` | integer | 1000 | Safety cap on auto-paged pages per command |
+| `SSH_DETECT_SHELL_ERRORS` | `true`, `false` | `true` | Detect device error strings in shell-path output and report a non-zero exit code |
+| `SSH_SHELL_ERROR_REGEX` | regex string | per-device default | Override the error pattern for all device types. Empty string disables detection |
+| `SSH_SHELL_ERROR_REGEX_<DEVICETYPE>` | regex string | per-device default | Override the error pattern for one device type (e.g. `SSH_SHELL_ERROR_REGEX_CISCO`) |
+| `PROFILE_<NAME>_SHELL_ERROR_REGEX` | regex string | - | Error pattern for one profile. Beats both env-level overrides. Empty value disables detection for that profile |
+| `SSH_SHELL_ERROR_EXIT_CODE` | integer | `1` | Exit code reported when a shell-path error string is matched |
 
 
 Any additional environment variables following the `<CONNECTIONID>_PASSWORD` convention are automatically used for credential resolution (see [Credential Resolution Convention](#credential-resolution-convention)).
@@ -771,6 +779,7 @@ These patterns are **always blocked** regardless of filter mode:
 | Tool | Description |
 |------|-------------|
 | `ssh_get_command_filter` | Show the command filter (whitelist/blacklist, global + per-profile, with precedence rules) and the host filter (allowed/blocked hosts) that apply to a connection; optionally check whether a specific command would be allowed. |
+| `ssh_get_profile_config` | Show which commands a named profile permits, without connecting: the effective allowed/blocked sets after the profile filter is layered on the global filter; optionally check one command. |
 | `ssh_list_connections` | List active connections with status. |
 | `ssh_check_connections` | Health check all connections (dead socket detection, shell status). |
 | `ssh_failed_connections` | List recent failed connection attempts (from the failed-connections JSONL log). |
